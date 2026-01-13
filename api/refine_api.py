@@ -41,6 +41,12 @@ ULTRASHAPE_CONFIG = os.environ.get(
 ULTRASHAPE_OUTPUT_DIR = os.environ.get("ULTRASHAPE_OUTPUT_DIR", API_ROOT)
 INPUT_DIR = os.path.join(API_ROOT, "inputs")
 KEEP_INTERMEDIATE = os.environ.get("KEEP_INTERMEDIATE", "0") == "1"
+HUNYUAN_CACHE_DIR = os.environ.get(
+    "HUNYUAN_CACHE_DIR", os.path.join(HUNYUAN_ROOT, "cache")
+)
+ULTRASHAPE_CACHE_DIR = os.environ.get(
+    "ULTRASHAPE_CACHE_DIR", os.path.join(ULTRASHAPE_ROOT, "cache")
+)
 
 HUNYUAN_ENV = os.environ.get("HUNYUAN_ENV", "anta3d")
 HUNYUAN_CUDA_VISIBLE_DEVICES = os.environ.get(
@@ -60,6 +66,16 @@ ULTRASHAPE_OOM_OCTREE_RES = os.environ.get("ULTRASHAPE_OOM_OCTREE_RES", "384")
 ULTRASHAPE_OOM_STEPS = os.environ.get("ULTRASHAPE_OOM_STEPS", "20")
 CONDA_EXE = os.environ.get("CONDA_EXE", "conda")
 CONDA_SH = os.environ.get("CONDA_SH")
+HOT_START_ENABLED = os.environ.get("HOT_START_ENABLED", "1") == "1"
+HOT_START_HUNYUAN = os.environ.get("HOT_START_HUNYUAN", "1") == "1"
+HOT_START_ULTRASHAPE = os.environ.get("HOT_START_ULTRASHAPE", "1") == "1"
+HOT_START_REMBG = os.environ.get("HOT_START_REMBG", "1") == "1"
+HUNYUAN_MODEL_SUBFOLDER = os.environ.get(
+    "HUNYUAN_MODEL_SUBFOLDER", "hunyuan3d-dit-v2-1"
+)
+ULTRASHAPE_DINO_MODEL = os.environ.get(
+    "ULTRASHAPE_DINO_MODEL", "facebook/dinov2-large"
+)
 
 JOB_LOCK = threading.Lock()
 _CONDA_SH_CACHE = None
@@ -99,10 +115,137 @@ class AsyncGenerateRequest(BaseModel):
     parameters: Optional[AsyncParameters] = None
 
 
+def _build_cache_env(cache_root: str) -> Dict[str, str]:
+    cache_root = os.path.abspath(cache_root)
+    hf_home = os.path.join(cache_root, "huggingface")
+    return {
+        "XDG_CACHE_HOME": cache_root,
+        "HF_HOME": hf_home,
+        "HF_HUB_CACHE": os.path.join(hf_home, "hub"),
+        "TRANSFORMERS_CACHE": os.path.join(hf_home, "transformers"),
+        "DIFFUSERS_CACHE": os.path.join(hf_home, "diffusers"),
+        "TORCH_HOME": os.path.join(cache_root, "torch"),
+        "HY3DGEN_MODELS": cache_root,
+        "U2NET_HOME": os.path.join(cache_root, "u2net"),
+    }
+
+
+def _ensure_cache_dirs(cache_root: str) -> None:
+    cache_root = os.path.abspath(cache_root)
+    os.makedirs(cache_root, exist_ok=True)
+    os.makedirs(os.path.join(cache_root, "huggingface"), exist_ok=True)
+    os.makedirs(os.path.join(cache_root, "torch"), exist_ok=True)
+    os.makedirs(os.path.join(cache_root, "u2net"), exist_ok=True)
+
+
+def _prefetch_hunyuan_models() -> None:
+    if not os.path.isdir(HUNYUAN_ROOT):
+        print(f"[hot-start] Hunyuan root not found: {HUNYUAN_ROOT}")
+        return
+
+    script = textwrap.dedent(
+        """
+        import os
+
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as exc:
+            raise RuntimeError(f"huggingface_hub unavailable: {exc}")
+
+        model_path = os.environ["HY3D_MODEL_PATH"]
+        subfolder = os.environ.get("HUNYUAN_MODEL_SUBFOLDER", "hunyuan3d-dit-v2-1")
+        base_dir = os.environ.get("HY3DGEN_MODELS", "~/.cache/hy3dgen")
+        model_fld = os.path.expanduser(os.path.join(base_dir, model_path))
+
+        snapshot_download(
+            repo_id=model_path,
+            allow_patterns=[f"{subfolder}/*"],
+            local_dir=model_fld,
+        )
+        print(f"[hot-start] hunyuan cached at {model_fld}")
+        """
+    ).strip()
+
+    extra_env = _build_cache_env(HUNYUAN_CACHE_DIR)
+    extra_env.update(
+        {
+            "HY3D_MODEL_PATH": MODEL_PATH,
+            "HUNYUAN_MODEL_SUBFOLDER": HUNYUAN_MODEL_SUBFOLDER,
+        }
+    )
+    try:
+        _run_in_conda(
+            HUNYUAN_ENV,
+            ["python", "-c", script],
+            cwd=HUNYUAN_ROOT,
+            extra_env=extra_env,
+        )
+    except Exception as exc:
+        print(f"[hot-start] hunyuan prefetch failed: {exc}")
+
+
+def _prefetch_ultrashape_models() -> None:
+    if not os.path.isdir(ULTRASHAPE_ROOT):
+        print(f"[hot-start] UltraShape root not found: {ULTRASHAPE_ROOT}")
+        return
+
+    script = textwrap.dedent(
+        """
+        import os
+
+        dino_model = os.environ.get("ULTRASHAPE_DINO_MODEL", "facebook/dinov2-large")
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as exc:
+            raise RuntimeError(f"huggingface_hub unavailable: {exc}")
+
+        snapshot_download(repo_id=dino_model)
+        print(f"[hot-start] dino cached: {dino_model}")
+
+        if os.environ.get("HOT_START_REMBG", "1") == "1":
+            try:
+                from rembg import new_session
+                new_session()
+                print("[hot-start] rembg session ready")
+            except Exception as exc:
+                print(f"[hot-start] rembg warmup failed: {exc}")
+        """
+    ).strip()
+
+    extra_env = _build_cache_env(ULTRASHAPE_CACHE_DIR)
+    extra_env.update(
+        {
+            "ULTRASHAPE_DINO_MODEL": ULTRASHAPE_DINO_MODEL,
+            "HOT_START_REMBG": "1" if HOT_START_REMBG else "0",
+        }
+    )
+    try:
+        _run_in_conda(
+            ULTRASHAPE_ENV,
+            ["python", "-c", script],
+            cwd=ULTRASHAPE_ROOT,
+            extra_env=extra_env,
+        )
+    except Exception as exc:
+        print(f"[hot-start] ultrashape prefetch failed: {exc}")
+
+
+def _hot_start() -> None:
+    if not HOT_START_ENABLED:
+        return
+    print("[hot-start] warming model caches")
+    if HOT_START_HUNYUAN:
+        _prefetch_hunyuan_models()
+    if HOT_START_ULTRASHAPE:
+        _prefetch_ultrashape_models()
+
+
 def _ensure_dirs() -> None:
     os.makedirs(HUNYUAN_OUTPUT_DIR, exist_ok=True)
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(ULTRASHAPE_OUTPUT_DIR, exist_ok=True)
+    _ensure_cache_dirs(HUNYUAN_CACHE_DIR)
+    _ensure_cache_dirs(ULTRASHAPE_CACHE_DIR)
 
 
 def _resolve_conda_sh() -> str:
@@ -193,17 +336,19 @@ def _run_hunyuan(image_path: str, output_path: str) -> None:
         raise RuntimeError(f"Hunyuan3D root not found: {HUNYUAN_ROOT}")
 
     print("[hunyuan] generating coarse mesh")
+    extra_env = {
+        "HUNYUAN_ROOT": HUNYUAN_ROOT,
+        "HY3D_MODEL_PATH": MODEL_PATH,
+        "INPUT_IMAGE": image_path,
+        "OUTPUT_GLB": output_path,
+        "CUDA_VISIBLE_DEVICES": HUNYUAN_CUDA_VISIBLE_DEVICES,
+    }
+    extra_env.update(_build_cache_env(HUNYUAN_CACHE_DIR))
     _run_in_conda(
         HUNYUAN_ENV,
         ["python", "-c", script],
         cwd=HUNYUAN_ROOT,
-        extra_env={
-            "HUNYUAN_ROOT": HUNYUAN_ROOT,
-            "HY3D_MODEL_PATH": MODEL_PATH,
-            "INPUT_IMAGE": image_path,
-            "OUTPUT_GLB": output_path,
-            "CUDA_VISIBLE_DEVICES": HUNYUAN_CUDA_VISIBLE_DEVICES,
-        },
+        extra_env=extra_env,
     )
     print(f"[hunyuan] coarse mesh saved: {output_path}")
 
@@ -223,6 +368,7 @@ def _run_ultrashape(image_path: str, mesh_path: str, output_dir: str) -> str:
             "ULTRASHAPE_OUTPUT_DIR": output_dir,
         }
     )
+    env.update(_build_cache_env(ULTRASHAPE_CACHE_DIR))
 
     print(
         "[ultrashape] ULTRASHAPE_CUDA_VISIBLE_DEVICES="
@@ -388,6 +534,7 @@ def _start_worker() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     _ensure_dirs()
+    _hot_start()
     _start_worker()
 
 

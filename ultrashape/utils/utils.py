@@ -35,6 +35,12 @@ def get_logger(name):
 logger = get_logger('hy3dgen.shapgen')
 
 
+def _default_cache_root() -> str:
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "cache")
+    )
+
+
 class synchronize_timer:
     """ Synchronized timer to count the inference time of `nn.Module.forward`.
 
@@ -94,7 +100,8 @@ def smart_load_model(
 ):
     original_model_path = model_path
     # try local path
-    base_dir = os.environ.get('HY3DGEN_MODELS', '~/.cache/hy3dgen')
+    base_dir = os.environ.get('HY3DGEN_MODELS', _default_cache_root())
+    base_dir = os.path.expanduser(base_dir)
     model_fld = os.path.expanduser(os.path.join(base_dir, model_path))
     model_path = os.path.expanduser(os.path.join(base_dir, model_path, subfolder))
     logger.info(f'Try to load model from local path: {model_path}')
