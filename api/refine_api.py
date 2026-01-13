@@ -2,11 +2,13 @@ import argparse
 import base64
 import io
 import os
+import queue
 import shlex
 import shutil
 import subprocess
 import threading
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional
 import textwrap
 
@@ -61,6 +63,11 @@ CONDA_SH = os.environ.get("CONDA_SH")
 
 JOB_LOCK = threading.Lock()
 _CONDA_SH_CACHE = None
+TASK_QUEUE_MAXSIZE = 1
+TASK_QUEUE: "queue.Queue[Dict[str, object]]" = queue.Queue(maxsize=TASK_QUEUE_MAXSIZE)
+TASKS_LOCK = threading.Lock()
+TASKS: Dict[str, Dict[str, Optional[str]]] = {}
+WORKER_THREAD: Optional[threading.Thread] = None
 
 app = FastAPI(title="UltraShape Refine API")
 
@@ -76,6 +83,20 @@ app.add_middleware(
 class GenerateRequest(BaseModel):
     image_base64: str
     precision: Optional[str] = "standard"
+
+
+class AsyncInput(BaseModel):
+    image_base64: str
+
+
+class AsyncParameters(BaseModel):
+    precision: Optional[str] = "standard"
+
+
+class AsyncGenerateRequest(BaseModel):
+    model: Optional[str] = "ultrashape-refine"
+    input: AsyncInput
+    parameters: Optional[AsyncParameters] = None
 
 
 def _ensure_dirs() -> None:
@@ -308,9 +329,66 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
     return refined_path
 
 
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _enqueue_task(image_bytes: bytes) -> str:
+    task_id = uuid.uuid4().hex
+    with TASKS_LOCK:
+        TASKS[task_id] = {
+            "task_id": task_id,
+            "task_status": "PENDING",
+            "submit_time": _now_str(),
+            "end_time": None,
+            "model_url": "",
+            "result_url": f"/api/v1/tasks/{task_id}/result",
+            "error_message": "",
+        }
+    TASK_QUEUE.put({"task_id": task_id, "image_bytes": image_bytes})
+    return task_id
+
+
+def _worker_loop() -> None:
+    while True:
+        task = TASK_QUEUE.get()
+        task_id = task["task_id"]
+        image_bytes = task["image_bytes"]
+        with TASKS_LOCK:
+            if task_id in TASKS:
+                TASKS[task_id]["task_status"] = "RUNNING"
+        try:
+            refined_path = _generate_refined_glb(image_bytes)
+        except Exception as exc:
+            with TASKS_LOCK:
+                if task_id in TASKS:
+                    TASKS[task_id]["task_status"] = "FAILED"
+                    TASKS[task_id]["end_time"] = _now_str()
+                    TASKS[task_id]["model_url"] = ""
+                    TASKS[task_id]["error_message"] = str(exc)
+        else:
+            with TASKS_LOCK:
+                if task_id in TASKS:
+                    TASKS[task_id]["task_status"] = "SUCCEEDED"
+                    TASKS[task_id]["end_time"] = _now_str()
+                    TASKS[task_id]["model_url"] = refined_path
+                    TASKS[task_id]["error_message"] = ""
+        finally:
+            TASK_QUEUE.task_done()
+
+
+def _start_worker() -> None:
+    global WORKER_THREAD
+    if WORKER_THREAD and WORKER_THREAD.is_alive():
+        return
+    WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True)
+    WORKER_THREAD.start()
+
+
 @app.on_event("startup")
 def _startup() -> None:
     _ensure_dirs()
+    _start_worker()
 
 
 @app.get("/health")
@@ -353,6 +431,76 @@ async def generate_3d(req: GenerateRequest):
         model_base64 = base64.b64encode(f.read()).decode("utf-8")
 
     return {"status": "success", "model_data": model_base64, "format": "glb"}
+
+
+@app.post("/api/v1/services/aigc/3d-refine/generation")
+async def generate_async(req: AsyncGenerateRequest):
+    image_bytes = _load_image_from_base64(req.input.image_base64)
+
+    if TASK_QUEUE.full():
+        raise HTTPException(status_code=429, detail="Queue is full, try again later")
+
+    task_id = _enqueue_task(image_bytes)
+    return {
+        "status_code": 200,
+        "request_id": uuid.uuid4().hex,
+        "code": "",
+        "message": "",
+        "output": {
+            "task_id": task_id,
+            "task_status": "PENDING",
+            "model_url": "",
+            "result_url": f"/api/v1/tasks/{task_id}/result",
+        },
+        "usage": None,
+    }
+
+
+@app.get("/api/v1/tasks/{task_id}")
+async def get_task(task_id: str):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return {
+        "status_code": 200,
+        "request_id": uuid.uuid4().hex,
+        "code": None,
+        "message": "",
+        "output": {
+            "task_id": task_id,
+            "task_status": task["task_status"],
+            "model_url": task["model_url"],
+            "result_url": task["result_url"],
+            "submit_time": task["submit_time"],
+            "end_time": task["end_time"],
+            "error_message": task["error_message"],
+        },
+        "usage": None,
+    }
+
+
+@app.get("/api/v1/tasks/{task_id}/result")
+async def get_task_result(task_id: str):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["task_status"] != "SUCCEEDED":
+        raise HTTPException(status_code=409, detail="Task not ready")
+
+    model_path = task["model_url"]
+    if not model_path or not os.path.exists(model_path):
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    return FileResponse(
+        model_path,
+        filename=os.path.basename(model_path),
+        media_type="model/gltf-binary",
+    )
 
 
 if __name__ == "__main__":
