@@ -24,6 +24,18 @@ def load_mesh(mesh_path: str, device: str = "cuda") -> Tuple[torch.Tensor, torch
         vertices, faces = torch.tensor(mesh_np["vertices"], device=device), torch.tensor(mesh_np["faces"].astype('i8'), device=device)
     else:
         mesh = trimesh.load(mesh_path, force='mesh')
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(mesh.dump())
+        if not hasattr(mesh, "faces") or mesh.faces is None:
+            raise ValueError(f"not a triangle mesh: {mesh_path}")
+        if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+            raise ValueError(f"empty mesh: {mesh_path}")
+        mesh.remove_degenerate_faces()
+        mesh.remove_duplicate_faces()
+        mesh.remove_infinite_values()
+        mesh.remove_unreferenced_vertices()
+        if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+            raise ValueError(f"empty mesh after cleanup: {mesh_path}")
         vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
         faces = torch.tensor(mesh.faces, dtype=torch.long, device=device)
     if faces.shape[0] > 2 * 1e8:
@@ -36,7 +48,7 @@ def compute_mesh_features(vertices: torch.Tensor, faces: torch.Tensor) -> Tuple[
     v0 = vertices[faces[:, 0]]
     v1 = vertices[faces[:, 1]]
     v2 = vertices[faces[:, 2]]
-    face_normals = torch.cross(v1 - v0, v2 - v0)
+    face_normals = torch.cross(v1 - v0, v2 - v0, dim=1)
     face_areas = torch.norm(face_normals, dim=1) * 0.5
     face_normals = face_normals / (face_areas.unsqueeze(1) * 2 + 1e-12)
     
@@ -113,6 +125,15 @@ def sample_surface_points(
     # Calculate number of sample points per face
     num_faces = len(faces)
     
+    sampling_weights = torch.nan_to_num(sampling_weights, nan=0.0, posinf=0.0, neginf=0.0)
+    total_weight = sampling_weights.sum()
+    if not torch.isfinite(total_weight).item() or total_weight.item() <= 0:
+        sampling_weights = face_areas
+    sampling_weights = torch.nan_to_num(sampling_weights, nan=0.0, posinf=0.0, neginf=0.0)
+    total_weight = sampling_weights.sum()
+    if not torch.isfinite(total_weight).item() or total_weight.item() <= 0:
+        sampling_weights = torch.ones_like(sampling_weights)
+
     # Chunk forward
     if min_samples_per_face > 0:
         base_samples = torch.full((num_faces,), min_samples_per_face, device=device)

@@ -97,16 +97,18 @@ class Diffuser(pl.LightningModule):
         if self.image_processor_cfg is not None:
             self.image_processor = instantiate_from_config(self.image_processor_cfg)
         self.pipeline_cfg = pipeline_cfg
-        from ...schedulers import FlowMatchEulerDiscreteScheduler
-        scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-        self.pipeline = instantiate_from_config(
-            pipeline_cfg,
-            vae=self.first_stage_model,
-            model=self.model,
-            scheduler=scheduler,
-            conditioner=self.cond_stage_model,
-            image_processor=self.image_processor,
-        )
+        self.pipeline = None
+        if self.pipeline_cfg is not None:
+            from ...schedulers import FlowMatchEulerDiscreteScheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+            self.pipeline = instantiate_from_config(
+                pipeline_cfg,
+                vae=self.first_stage_model,
+                model=self.model,
+                scheduler=scheduler,
+                conditioner=self.cond_stage_model,
+                image_processor=self.image_processor,
+            )
 
         # ========= torch compile to accelerate ========= #
         self.torch_compile = torch_compile

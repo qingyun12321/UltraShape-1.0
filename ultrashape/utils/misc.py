@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import glob
 import importlib
+import pathlib
+import numpy as np
 from omegaconf import OmegaConf, DictConfig, ListConfig
 
 import torch
@@ -93,12 +96,38 @@ def instantiate_vae_from_config_local(config, **kwargs):
     if not config.get("from_pretrained", None):
         raise FileNotFoundError(f"Need from_pretrained!")
     
-    ckpt_path = config["from_pretrained"]
+    ckpt_path = os.path.expanduser(config["from_pretrained"])
+    if os.path.isdir(ckpt_path):
+        candidates = sorted(
+            glob.glob(os.path.join(ckpt_path, "*.ckpt")),
+            key=os.path.getmtime,
+        )
+        if not candidates:
+            raise FileNotFoundError(f"No .ckpt files found in {ckpt_path}")
+        ckpt_path = candidates[-1]
             
     logger.info(f"Loading model from {ckpt_path}")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Model file {ckpt_path} not found")
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    try:
+        safe_globals = [
+            pathlib.PosixPath,
+            pathlib.WindowsPath,
+            np.dtype,
+            np.ndarray,
+            np.core.multiarray.scalar,
+        ]
+        reconstruct = getattr(np.core.multiarray, "_reconstruct", None)
+        if reconstruct is not None:
+            safe_globals.append(reconstruct)
+        torch.serialization.add_safe_globals(safe_globals)
+    except Exception:
+        pass
+    try:
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    except Exception as exc:
+        logger.warning(f"weights_only load failed ({exc}); retrying with weights_only=False")
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     if 'state_dict' not in ckpt:
         # deepspeed ckpt
@@ -108,13 +137,20 @@ def instantiate_vae_from_config_local(config, **kwargs):
             state_dict[new_k] = ckpt[k]
     else:
         state_dict = ckpt["state_dict"]
+        # Normalize common prefixes from Lightning checkpoints.
+        prefixes = ("vae_model.", "model.", "first_stage_model.")
+        for prefix in prefixes:
+            if all(k.startswith(prefix) for k in state_dict.keys()):
+                state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
+                logger.info(f"Stripped state_dict prefix '{prefix}'")
+                break
 
     params = config.get("params", dict())
     kwargs.update(params)
     instance = cls(**kwargs)
 
 
-    missing, unexpected = instance.load_state_dict(state_dict)
+    missing, unexpected = instance.load_state_dict(state_dict, strict=False)
     print(f"VAE Missing Keys: {missing}")
     print(f"VAE Unexpected Keys: {unexpected}")
 

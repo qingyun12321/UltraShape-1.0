@@ -42,7 +42,14 @@ from einops import rearrange
 from .moe_layers import MoEBlock
 from ...utils import logger, synchronize_timer, smart_load_model
 
-from flash_attn import flash_attn_varlen_func
+_DISABLE_FLASH_ATTN = os.environ.get("ULTRASHAPE_DISABLE_FLASH_ATTN", "").lower() in ("1", "true", "yes")
+if not _DISABLE_FLASH_ATTN:
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except Exception:
+        flash_attn_varlen_func = None
+else:
+    flash_attn_varlen_func = None
 
 
 def modulate(x, shift, scale):
@@ -189,7 +196,8 @@ class CrossAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        if has_padding:
+        use_flash_attn = flash_attn_varlen_func is not None
+        if has_padding and use_flash_attn:
             seqlens_k = y_mask.sum(dim=1).int()
             q_flat = q.reshape(-1, self.num_heads, self.head_dim)
             
@@ -234,6 +242,10 @@ class CrossAttention(nn.Module):
                 q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
                 
                 attn_mask = None
+                if has_padding:
+                    pad_mask = ~y_mask
+                    attn_mask = pad_mask.unsqueeze(1).unsqueeze(1)
+                    attn_mask = attn_mask.to(dtype=q.dtype) * torch.finfo(q.dtype).min
                 context = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask
                 ).transpose(1, 2).reshape(b, s1, -1)

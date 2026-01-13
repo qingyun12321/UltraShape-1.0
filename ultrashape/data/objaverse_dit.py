@@ -181,44 +181,55 @@ class ObjaverseDataset(Dataset):
         
     def _load_image(self, index: int) -> Dict[str, Any]:
         ret = {}
-        sel_idx = random.randint(0, 15)
-        ret["sel_image_idx"] = sel_idx
         obj_name = self.uids[index]
-        img_path = f'{self.image_paths[obj_name]}/{os.path.basename(self.image_paths[obj_name])}/rgba/' + f"{sel_idx:03d}.png"
- 
-        images, masks = [], []
-        image = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        assert image.shape[2] == 4
-        alpha = image[:, :, 3:4].astype(np.float32) / 255
-        forground = image[:, :, :3]
-        background = np.ones_like(forground) * 255
-        img_new = forground * alpha + background * (1 - alpha)
-        image = img_new.astype(np.uint8)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = (alpha[:, :, 0] * 255).astype(np.uint8)
+        if obj_name not in self.image_paths:
+            raise KeyError(f"Missing render path for {obj_name}")
 
-        if self.padding:
-            h, w = image.shape[:2]
-            binary = mask > 0.3
-            non_zero_coords = np.argwhere(binary)
-            x_min, y_min = non_zero_coords.min(axis=0)
-            x_max, y_max = non_zero_coords.max(axis=0)
-            image, mask = padding(
-                image[max(x_min - 5, 0):min(x_max + 5, h), max(y_min - 5, 0):min(y_max + 5, w)],
-                mask[max(x_min - 5, 0):min(x_max + 5, h), max(y_min - 5, 0):min(y_max + 5, w)],
-                center=True, padding_ratio_range=self.padding_ratio_range)
-        
-        if self.image_transform:
-            image = self.image_transform(image)
-            mask = np.stack((mask, mask, mask), axis=-1)
-            mask = self.image_transform(mask)
-        
-        images.append(image)
-        masks.append(mask)
-        ret["image"] = torch.cat(images, dim=0)
-        ret["mask"] = torch.cat(masks, dim=0)[:1, ...]
-        
-        return ret
+        base_path = self.image_paths[obj_name]
+        indices = list(range(16))
+        random.shuffle(indices)
+        last_error: Optional[Exception] = None
+
+        for sel_idx in indices:
+            ret["sel_image_idx"] = sel_idx
+            img_path = f"{base_path}/{os.path.basename(base_path)}/rgba/{sel_idx:03d}.png"
+            image = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if image is None or image.ndim != 3 or image.shape[2] < 4:
+                last_error = ValueError(f"Invalid image at {img_path}")
+                continue
+
+            alpha = image[:, :, 3:4].astype(np.float32) / 255
+            forground = image[:, :, :3]
+            background = np.ones_like(forground) * 255
+            img_new = forground * alpha + background * (1 - alpha)
+            image = img_new.astype(np.uint8)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mask = (alpha[:, :, 0] * 255).astype(np.uint8)
+
+            if self.padding:
+                h, w = image.shape[:2]
+                binary = mask > 0.3
+                non_zero_coords = np.argwhere(binary)
+                if non_zero_coords.size == 0:
+                    last_error = ValueError(f"Empty mask at {img_path}")
+                    continue
+                x_min, y_min = non_zero_coords.min(axis=0)
+                x_max, y_max = non_zero_coords.max(axis=0)
+                image, mask = padding(
+                    image[max(x_min - 5, 0):min(x_max + 5, h), max(y_min - 5, 0):min(y_max + 5, w)],
+                    mask[max(x_min - 5, 0):min(x_max + 5, h), max(y_min - 5, 0):min(y_max + 5, w)],
+                    center=True, padding_ratio_range=self.padding_ratio_range)
+
+            if self.image_transform:
+                image = self.image_transform(image)
+                mask = np.stack((mask, mask, mask), axis=-1)
+                mask = self.image_transform(mask)
+
+            ret["image"] = torch.cat([image], dim=0)
+            ret["mask"] = torch.cat([mask], dim=0)[:1, ...]
+            return ret
+
+        raise last_error or ValueError(f"No valid renders for {obj_name}")
 
     def get_data(self, index):
         ret = self._load_shape(index)

@@ -1,51 +1,52 @@
 name: "UltraShape Refine VAE"
 
 training:
-  # ckpt_path: 
-  steps: 10_0000_0000
+  # ckpt_path:
+  steps: 620
   use_amp: true
   amp_type: "bf16"
   base_lr: 1e-5
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  every_n_train_steps: 2500
-  val_check_interval: 1000
-  limit_val_batches: 16
+  every_n_train_steps: 100
+  val_check_interval: 100
+  log_every_n_steps: 20
+  limit_val_batches: 0
 
 dataset:
   target: ultrashape.data.objaverse_vae.ObjaverseDataModule
   params:
-    batch_size: 4
-    num_workers: 4
-    val_num_workers: 4
+    batch_size: 1
+    num_workers: 2
+    val_num_workers: 2
 
-    # data 
-    training_data_list: data/data_list
-    sample_pcd_dir: data/sample
+    # data
+    training_data_list: ../.objaverse/ultrashape_data/splits
+    sample_pcd_dir: ../.objaverse/ultrashape_data/sample
 
     # input_pcd
-    pc_size: &pc_size 163840
+    pc_size: &pc_size 65536
     pc_sharpedge_size: &pc_sharpedge_size 0
     sharpedge_label: &sharpedge_label true
     return_normal: true
 
     # sup_pcd
-    sup_near_uni_size: 100000
-    sup_near_sharp_size: 100000
-    sup_space_size: 100000
+    sup_near_uni_size: 32768
+    sup_near_sharp_size: 32768
+    sup_space_size: 32768
     tsdf_threshold: 0.01
 
 model:
   target: ultrashape.models.autoencoders.VAETrainer
   params:
-    ckpt_path: ckpt/vae_step=15000.ckpt
+    ckpt_path: null
     torch_compile: false
     save_dir: outputs/vae_recon
-    mc_res: 512
+    mc_res: 128
     vae_config:
       target: ultrashape.models.autoencoders.ShapeVAE
       params:
-        num_latents: &num_latents 8192 # 4096
+        num_latents: &num_latents 2048 # reduced for lower memory
         embed_dim: 64
         num_freqs: 8
         include_pi: false
@@ -76,11 +77,11 @@ model:
       scheduler:
         target: ultrashape.utils.trainings.lr_scheduler.LambdaWarmUpCosineFactorScheduler
         params:
-          warm_up_steps: 500 # 5000
+          warm_up_steps: 50 # 5000
           f_start: 1.e-6
           f_min: 1.e-3
           f_max: 1.0
-        
+
     loss_cfg:
       lambda_logits: 1.
       lambda_kl: 0.001
