@@ -1,12 +1,15 @@
 import argparse
 import base64
 import io
+import json
 import os
 import queue
 import shlex
 import shutil
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -76,6 +79,14 @@ HUNYUAN_MODEL_SUBFOLDER = os.environ.get(
 ULTRASHAPE_DINO_MODEL = os.environ.get(
     "ULTRASHAPE_DINO_MODEL", "facebook/dinov2-large"
 )
+USE_REMOTE_SERVICES = os.environ.get("USE_REMOTE_SERVICES", "1") == "1"
+HUNYUAN_SERVICE_URL = os.environ.get(
+    "HUNYUAN_SERVICE_URL", "http://127.0.0.1:9084"
+)
+ULTRASHAPE_SERVICE_URL = os.environ.get(
+    "ULTRASHAPE_SERVICE_URL", "http://127.0.0.1:9085"
+)
+SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
 
 JOB_LOCK = threading.Lock()
 _CONDA_SH_CACHE = None
@@ -136,6 +147,56 @@ def _ensure_cache_dirs(cache_root: str) -> None:
     os.makedirs(os.path.join(cache_root, "huggingface"), exist_ok=True)
     os.makedirs(os.path.join(cache_root, "torch"), exist_ok=True)
     os.makedirs(os.path.join(cache_root, "u2net"), exist_ok=True)
+
+
+def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str, object]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            if response.status >= 400:
+                raise RuntimeError(f"{url} failed: {response.status} {body}")
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8") if exc.fp else str(exc)
+        raise RuntimeError(f"{url} failed: {exc.code} {details}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{url} unavailable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{url} returned invalid JSON: {exc}") from exc
+
+
+def _call_hunyuan_service(image_bytes: bytes) -> bytes:
+    payload = {"image_base64": base64.b64encode(image_bytes).decode("utf-8")}
+    response = _post_json(
+        f"{HUNYUAN_SERVICE_URL}/generate", payload, timeout=SERVICE_TIMEOUT
+    )
+    mesh_base64 = response.get("mesh_base64")
+    if not mesh_base64:
+        raise RuntimeError("Hunyuan service returned empty mesh")
+    return base64.b64decode(mesh_base64)
+
+
+def _call_ultrashape_service(image_bytes: bytes, mesh_bytes: bytes) -> bytes:
+    payload = {
+        "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
+        "mesh_base64": base64.b64encode(mesh_bytes).decode("utf-8"),
+        "steps": int(ULTRASHAPE_STEPS),
+        "octree_res": int(ULTRASHAPE_OCTREE_RES),
+    }
+    response = _post_json(
+        f"{ULTRASHAPE_SERVICE_URL}/refine", payload, timeout=SERVICE_TIMEOUT
+    )
+    mesh_base64 = response.get("mesh_base64")
+    if not mesh_base64:
+        raise RuntimeError("UltraShape service returned empty mesh")
+    return base64.b64decode(mesh_base64)
 
 
 def _prefetch_hunyuan_models() -> None:
@@ -231,7 +292,7 @@ def _prefetch_ultrashape_models() -> None:
 
 
 def _hot_start() -> None:
-    if not HOT_START_ENABLED:
+    if not HOT_START_ENABLED or USE_REMOTE_SERVICES:
         return
     print("[hot-start] warming model caches")
     if HOT_START_HUNYUAN:
@@ -458,10 +519,24 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
 
     try:
         with JOB_LOCK:
-            _run_hunyuan(input_image_path, coarse_mesh_path)
-            refined_path = _run_ultrashape(
-                input_image_path, coarse_mesh_path, ULTRASHAPE_OUTPUT_DIR
-            )
+            if USE_REMOTE_SERVICES:
+                coarse_mesh_bytes = _call_hunyuan_service(image_bytes)
+                with open(coarse_mesh_path, "wb") as coarse_file:
+                    coarse_file.write(coarse_mesh_bytes)
+                refined_mesh_bytes = _call_ultrashape_service(
+                    image_bytes, coarse_mesh_bytes
+                )
+                base_name = os.path.splitext(os.path.basename(input_image_path))[0]
+                refined_path = os.path.join(
+                    ULTRASHAPE_OUTPUT_DIR, f"{base_name}_refined.glb"
+                )
+                with open(refined_path, "wb") as refined_file:
+                    refined_file.write(refined_mesh_bytes)
+            else:
+                _run_hunyuan(input_image_path, coarse_mesh_path)
+                refined_path = _run_ultrashape(
+                    input_image_path, coarse_mesh_path, ULTRASHAPE_OUTPUT_DIR
+                )
             backup_path = os.path.join(API_ROOT, "output.glb")
             shutil.copyfile(refined_path, backup_path)
             print(f"[api] backup saved: {backup_path}")
@@ -657,4 +732,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     _ensure_dirs()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    config = uvicorn.Config(app=app, host=args.host, port=args.port, log_level="info")
+    server = uvicorn.Server(config)
+    server.run()
