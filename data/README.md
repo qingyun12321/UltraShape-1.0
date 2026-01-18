@@ -33,6 +33,7 @@ Common flags:
 - `--limit 20` to download only the first 20 models.
 - `--prefer-glb` to download real GLB assets when available.
 - `--include-unsavable` to include captures marked as unsavable.
+- `--request-retries 5` to retry failed network requests more times.
 
 ## Convert to GLB
 

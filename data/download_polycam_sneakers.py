@@ -14,6 +14,11 @@ ALGOLIA_APP_ID = "R4Z39A8FL1"
 ALGOLIA_INDEX = "capture"
 DEFAULT_FILTERS = "tags:sneaker OR tags:shoe"
 DEFAULT_HITS_PER_PAGE = 50
+DEFAULT_REQUEST_RETRIES = 3
+DEFAULT_REQUEST_BACKOFF = 2.0
+SEARCH_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 60
+RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def parse_env_json(text):
@@ -24,8 +29,10 @@ def parse_env_json(text):
     return json.loads(text[start : end + 1])
 
 
-def fetch_algolia_search_key(session):
-    resp = session.get(ENV_URL, timeout=30)
+def fetch_algolia_search_key(session, retries, backoff):
+    resp = request_with_retries(
+        session, "GET", ENV_URL, retries, backoff, timeout=SEARCH_TIMEOUT
+    )
     resp.raise_for_status()
     env = parse_env_json(resp.text)
     key = env.get("ALGOLIA_SEARCH_KEY")
@@ -58,28 +65,84 @@ def is_placeholder_glb(url):
     return not url or "update-placeholder.glb" in url
 
 
-def algolia_search(session, app_id, api_key, params):
+def request_with_retries(session, method, url, retries, backoff, **kwargs):
+    if retries < 1:
+        retries = 1
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.request(method, url, **kwargs)
+            if resp.status_code in RETRY_STATUS_CODES:
+                resp.close()
+                raise requests.HTTPError(
+                    f"HTTP {resp.status_code} for {url}", response=resp
+                )
+            return resp
+        except requests.exceptions.RequestException as exc:
+            if attempt >= retries:
+                raise
+            log_status(
+                f"retry: {method} {url} attempt {attempt}/{retries} failed ({exc})"
+            )
+            time.sleep(backoff * attempt)
+
+
+def algolia_search(session, app_id, api_key, params, retries, backoff):
     url = f"https://{app_id}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
     headers = {
         "X-Algolia-API-Key": api_key,
         "X-Algolia-Application-Id": app_id,
     }
-    resp = session.post(url, json={"params": params}, headers=headers, timeout=30)
+    resp = request_with_retries(
+        session,
+        "POST",
+        url,
+        retries,
+        backoff,
+        timeout=SEARCH_TIMEOUT,
+        json={"params": params},
+        headers=headers,
+    )
     resp.raise_for_status()
     return resp.json()
 
 
-def download_file(session, url, dest, overwrite):
+def download_file(session, url, dest, overwrite, retries, backoff):
     if dest.exists() and not overwrite:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with session.get(url, stream=True, timeout=60) as resp:
-        resp.raise_for_status()
-        with open(dest, "wb") as handle:
-            for chunk in resp.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    handle.write(chunk)
-    return True
+    temp_path = dest.with_name(dest.name + ".part")
+    if retries < 1:
+        retries = 1
+    for attempt in range(1, retries + 1):
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+            with session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as resp:
+                if resp.status_code in RETRY_STATUS_CODES:
+                    raise requests.HTTPError(
+                        f"HTTP {resp.status_code} for {url}", response=resp
+                    )
+                resp.raise_for_status()
+                with open(temp_path, "wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=1024 * 512):
+                        if chunk:
+                            handle.write(chunk)
+            temp_path.replace(dest)
+            return True
+        except requests.exceptions.RequestException as exc:
+            if attempt >= retries:
+                if temp_path.exists():
+                    temp_path.unlink()
+                raise
+            log_status(
+                f"retry: download {dest.name} attempt {attempt}/{retries} failed ({exc})"
+            )
+            time.sleep(backoff * attempt)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+    return False
 
 
 def collect_assets(hit, prefer_glb):
@@ -127,10 +190,12 @@ def log_status(message):
     print("\n" + message)
 
 
-def redownload_with_retries(session, url, dest, expected_size, retries):
+def redownload_with_retries(session, url, dest, expected_size, retries, backoff):
+    if retries < 1:
+        retries = 1
     for attempt in range(1, retries + 1):
         try:
-            download_file(session, url, dest, overwrite=True)
+            download_file(session, url, dest, overwrite=True, retries=1, backoff=backoff)
         except Exception as exc:
             log_status(f"verify: retry {attempt} failed for {dest.name} ({exc})")
         if file_ok(dest, expected_size):
@@ -213,6 +278,18 @@ def main():
         help="Algolia filter string.",
     )
     parser.add_argument(
+        "--request-retries",
+        type=int,
+        default=DEFAULT_REQUEST_RETRIES,
+        help="Retry count for network requests.",
+    )
+    parser.add_argument(
+        "--request-backoff",
+        type=float,
+        default=DEFAULT_REQUEST_BACKOFF,
+        help="Backoff seconds between retries (multiplied by attempt).",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         help="Verify downloaded files and retry any mismatches.",
@@ -235,7 +312,9 @@ def main():
     )
 
     try:
-        search_key = fetch_algolia_search_key(session)
+        search_key = fetch_algolia_search_key(
+            session, args.request_retries, args.request_backoff
+        )
     except Exception as exc:
         print(f"Failed to fetch Algolia search key: {exc}", file=sys.stderr)
         return 1
@@ -255,7 +334,14 @@ def main():
     while True:
         params = build_params(args.filters, args.hits_per_page, page)
         try:
-            payload = algolia_search(session, ALGOLIA_APP_ID, search_key, params)
+            payload = algolia_search(
+                session,
+                ALGOLIA_APP_ID,
+                search_key,
+                params,
+                args.request_retries,
+                args.request_backoff,
+            )
         except Exception as exc:
             print(f"Search failed on page {page}: {exc}", file=sys.stderr)
             return 1
@@ -297,7 +383,14 @@ def main():
                 url_by_relpath[rel_path] = url
                 expected_size = expected_sizes.get(rel_path) if args.verify else None
                 try:
-                    downloaded_now = download_file(session, url, dest, args.overwrite)
+                    downloaded_now = download_file(
+                        session,
+                        url,
+                        dest,
+                        args.overwrite,
+                        args.request_retries,
+                        args.request_backoff,
+                    )
                     if downloaded_now:
                         files_downloaded += 1
                         files_ok += 1
@@ -309,6 +402,7 @@ def main():
                                 dest,
                                 expected_size,
                                 args.verify_retries,
+                                args.request_backoff,
                             ):
                                 files_retry_ok += 1
                             else:
@@ -346,6 +440,7 @@ def main():
                         dest,
                         expected_size,
                         args.verify_retries,
+                        args.request_backoff,
                     ):
                         files_retry_ok += 1
                     else:
