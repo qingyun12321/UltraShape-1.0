@@ -11,8 +11,9 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 import textwrap
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -97,6 +98,7 @@ ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
     "ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST", ULTRASHAPE_CUDA_VISIBLE_DEVICES
 )
 SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
+MAX_GLB_FILES = int(os.environ.get("MAX_GLB_FILES", "0"))
 
 _CONDA_SH_CACHE = None
 TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
@@ -107,6 +109,8 @@ WORKER_THREADS: List[threading.Thread] = []
 SLOT_QUEUE: "queue.Queue[Dict[str, str]]" = queue.Queue()
 SLOTS_LOCK = threading.Lock()
 SLOTS: List[Dict[str, str]] = []
+RESULTS_LOCK = threading.Lock()
+RESULTS_QUEUE: Deque[str] = deque()
 
 app = FastAPI(title="UltraShape Refine API")
 
@@ -230,6 +234,35 @@ def _acquire_slot() -> Dict[str, str]:
 def _release_slot(slot: Dict[str, str]) -> None:
     SLOT_QUEUE.put(slot)
     print(f"[scheduler] released slot {slot['slot_id']}")
+
+
+def _resolve_max_glb_files() -> int:
+    if MAX_GLB_FILES > 0:
+        return MAX_GLB_FILES
+    return max(1, len(SLOTS))
+
+
+def _record_result_path(result_path: str) -> None:
+    if not result_path:
+        return
+    with RESULTS_LOCK:
+        if result_path in RESULTS_QUEUE:
+            RESULTS_QUEUE.remove(result_path)
+        RESULTS_QUEUE.append(result_path)
+
+
+def _prune_results() -> None:
+    max_keep = _resolve_max_glb_files()
+    stale: List[str] = []
+    with RESULTS_LOCK:
+        while len(RESULTS_QUEUE) > max_keep:
+            stale.append(RESULTS_QUEUE.popleft())
+    for path in stale:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                print(f"[cleanup] failed to remove {path}: {exc}")
 
 
 def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str, object]:
@@ -637,6 +670,8 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
             backup_path = os.path.join(API_ROOT, "output.glb")
             shutil.copyfile(refined_path, backup_path)
             print(f"[api] backup saved: {backup_path}")
+            _record_result_path(refined_path)
+            _prune_results()
         finally:
             if not KEEP_INTERMEDIATE:
                 if os.path.exists(input_image_path):
