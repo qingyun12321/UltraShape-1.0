@@ -86,15 +86,27 @@ HUNYUAN_SERVICE_URL = os.environ.get(
 ULTRASHAPE_SERVICE_URL = os.environ.get(
     "ULTRASHAPE_SERVICE_URL", "http://127.0.0.1:9085"
 )
+HUNYUAN_SERVICE_URLS = os.environ.get("HUNYUAN_SERVICE_URLS", HUNYUAN_SERVICE_URL)
+ULTRASHAPE_SERVICE_URLS = os.environ.get(
+    "ULTRASHAPE_SERVICE_URLS", ULTRASHAPE_SERVICE_URL
+)
+HUNYUAN_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
+    "HUNYUAN_CUDA_VISIBLE_DEVICES_LIST", HUNYUAN_CUDA_VISIBLE_DEVICES
+)
+ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
+    "ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST", ULTRASHAPE_CUDA_VISIBLE_DEVICES
+)
 SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
 
-JOB_LOCK = threading.Lock()
 _CONDA_SH_CACHE = None
-TASK_QUEUE_MAXSIZE = 1
+TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
 TASK_QUEUE: "queue.Queue[Dict[str, object]]" = queue.Queue(maxsize=TASK_QUEUE_MAXSIZE)
 TASKS_LOCK = threading.Lock()
 TASKS: Dict[str, Dict[str, Optional[str]]] = {}
-WORKER_THREAD: Optional[threading.Thread] = None
+WORKER_THREADS: List[threading.Thread] = []
+SLOT_QUEUE: "queue.Queue[Dict[str, str]]" = queue.Queue()
+SLOTS_LOCK = threading.Lock()
+SLOTS: List[Dict[str, str]] = []
 
 app = FastAPI(title="UltraShape Refine API")
 
@@ -149,6 +161,77 @@ def _ensure_cache_dirs(cache_root: str) -> None:
     os.makedirs(os.path.join(cache_root, "u2net"), exist_ok=True)
 
 
+def _split_slots(value: str) -> List[str]:
+    return [item.strip() for item in value.split(";") if item.strip()]
+
+
+def _build_slots() -> List[Dict[str, str]]:
+    if USE_REMOTE_SERVICES:
+        hunyuan_urls = _split_slots(HUNYUAN_SERVICE_URLS)
+        ultrashape_urls = _split_slots(ULTRASHAPE_SERVICE_URLS)
+        if len(hunyuan_urls) != len(ultrashape_urls):
+            raise RuntimeError(
+                "HUNYUAN_SERVICE_URLS and ULTRASHAPE_SERVICE_URLS length mismatch"
+            )
+        slots = []
+        for idx, (hunyuan_url, ultrashape_url) in enumerate(
+            zip(hunyuan_urls, ultrashape_urls)
+        ):
+            slots.append(
+                {
+                    "slot_id": str(idx),
+                    "hunyuan_url": hunyuan_url,
+                    "ultrashape_url": ultrashape_url,
+                }
+            )
+        return slots
+
+    hunyuan_devices = _split_slots(HUNYUAN_CUDA_VISIBLE_DEVICES_LIST)
+    ultrashape_devices = _split_slots(ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST)
+    if len(hunyuan_devices) != len(ultrashape_devices):
+        raise RuntimeError(
+            "HUNYUAN_CUDA_VISIBLE_DEVICES_LIST and "
+            "ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+        )
+    slots = []
+    for idx, (hunyuan_device, ultrashape_device) in enumerate(
+        zip(hunyuan_devices, ultrashape_devices)
+    ):
+        slots.append(
+            {
+                "slot_id": str(idx),
+                "hunyuan_device": hunyuan_device,
+                "ultrashape_device": ultrashape_device,
+            }
+        )
+    return slots
+
+
+def _init_slots() -> None:
+    global SLOTS
+    with SLOTS_LOCK:
+        if SLOTS:
+            return
+        SLOTS = _build_slots()
+        if not SLOTS:
+            raise RuntimeError("No slots configured")
+        for slot in SLOTS:
+            SLOT_QUEUE.put(slot)
+        slot_ids = ",".join(slot["slot_id"] for slot in SLOTS)
+        print(f"[scheduler] slots ready: {slot_ids}")
+
+
+def _acquire_slot() -> Dict[str, str]:
+    slot = SLOT_QUEUE.get()
+    print(f"[scheduler] acquired slot {slot['slot_id']}")
+    return slot
+
+
+def _release_slot(slot: Dict[str, str]) -> None:
+    SLOT_QUEUE.put(slot)
+    print(f"[scheduler] released slot {slot['slot_id']}")
+
+
 def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str, object]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -172,10 +255,10 @@ def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str
         raise RuntimeError(f"{url} returned invalid JSON: {exc}") from exc
 
 
-def _call_hunyuan_service(image_bytes: bytes) -> bytes:
+def _call_hunyuan_service(image_bytes: bytes, base_url: str) -> bytes:
     payload = {"image_base64": base64.b64encode(image_bytes).decode("utf-8")}
     response = _post_json(
-        f"{HUNYUAN_SERVICE_URL}/generate", payload, timeout=SERVICE_TIMEOUT
+        f"{base_url}/generate", payload, timeout=SERVICE_TIMEOUT
     )
     mesh_base64 = response.get("mesh_base64")
     if not mesh_base64:
@@ -183,7 +266,9 @@ def _call_hunyuan_service(image_bytes: bytes) -> bytes:
     return base64.b64decode(mesh_base64)
 
 
-def _call_ultrashape_service(image_bytes: bytes, mesh_bytes: bytes) -> bytes:
+def _call_ultrashape_service(
+    image_bytes: bytes, mesh_bytes: bytes, base_url: str
+) -> bytes:
     payload = {
         "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
         "mesh_base64": base64.b64encode(mesh_bytes).decode("utf-8"),
@@ -191,7 +276,7 @@ def _call_ultrashape_service(image_bytes: bytes, mesh_bytes: bytes) -> bytes:
         "octree_res": int(ULTRASHAPE_OCTREE_RES),
     }
     response = _post_json(
-        f"{ULTRASHAPE_SERVICE_URL}/refine", payload, timeout=SERVICE_TIMEOUT
+        f"{base_url}/refine", payload, timeout=SERVICE_TIMEOUT
     )
     mesh_base64 = response.get("mesh_base64")
     if not mesh_base64:
@@ -370,7 +455,7 @@ def _run_in_conda(env_name: str, args: List[str], cwd: str, extra_env: Dict) -> 
         print(result.stdout.strip())
 
 
-def _run_hunyuan(image_path: str, output_path: str) -> None:
+def _run_hunyuan(image_path: str, output_path: str, cuda_devices: str) -> None:
     script = textwrap.dedent(
         """
         import os
@@ -402,7 +487,7 @@ def _run_hunyuan(image_path: str, output_path: str) -> None:
         "HY3D_MODEL_PATH": MODEL_PATH,
         "INPUT_IMAGE": image_path,
         "OUTPUT_GLB": output_path,
-        "CUDA_VISIBLE_DEVICES": HUNYUAN_CUDA_VISIBLE_DEVICES,
+        "CUDA_VISIBLE_DEVICES": cuda_devices,
     }
     extra_env.update(_build_cache_env(HUNYUAN_CACHE_DIR))
     _run_in_conda(
@@ -414,7 +499,9 @@ def _run_hunyuan(image_path: str, output_path: str) -> None:
     print(f"[hunyuan] coarse mesh saved: {output_path}")
 
 
-def _run_ultrashape(image_path: str, mesh_path: str, output_dir: str) -> str:
+def _run_ultrashape(
+    image_path: str, mesh_path: str, output_dir: str, cuda_devices: str
+) -> str:
     if not os.path.isdir(ULTRASHAPE_ROOT):
         raise RuntimeError(f"UltraShape root not found: {ULTRASHAPE_ROOT}")
 
@@ -423,7 +510,7 @@ def _run_ultrashape(image_path: str, mesh_path: str, output_dir: str) -> str:
         {
             "ULTRASHAPE_DISABLE_FLASH_ATTN": "1",
             "PYTORCH_CUDA_ALLOC_CONF": PYTORCH_CUDA_ALLOC_CONF,
-            "ULTRASHAPE_CUDA_VISIBLE_DEVICES": ULTRASHAPE_CUDA_VISIBLE_DEVICES,
+            "ULTRASHAPE_CUDA_VISIBLE_DEVICES": cuda_devices,
             "ULTRASHAPE_OCTREE_RES": str(ULTRASHAPE_OCTREE_RES),
             "ULTRASHAPE_STEPS": str(ULTRASHAPE_STEPS),
             "ULTRASHAPE_OUTPUT_DIR": output_dir,
@@ -510,21 +597,26 @@ def _load_image_from_base64(data: str) -> bytes:
 
 def _generate_refined_glb(image_bytes: bytes) -> str:
     _ensure_dirs()
+    _init_slots()
+    slot = _acquire_slot()
     request_id = uuid.uuid4().hex
     input_image_path = os.path.join(INPUT_DIR, f"{request_id}.png")
     coarse_mesh_path = os.path.join(HUNYUAN_OUTPUT_DIR, f"{request_id}.glb")
+    refined_path = ""
 
     print("[api] received request, saving input image")
     _save_image_bytes(image_bytes, input_image_path)
 
     try:
-        with JOB_LOCK:
+        try:
             if USE_REMOTE_SERVICES:
-                coarse_mesh_bytes = _call_hunyuan_service(image_bytes)
+                coarse_mesh_bytes = _call_hunyuan_service(
+                    image_bytes, slot["hunyuan_url"]
+                )
                 with open(coarse_mesh_path, "wb") as coarse_file:
                     coarse_file.write(coarse_mesh_bytes)
                 refined_mesh_bytes = _call_ultrashape_service(
-                    image_bytes, coarse_mesh_bytes
+                    image_bytes, coarse_mesh_bytes, slot["ultrashape_url"]
                 )
                 base_name = os.path.splitext(os.path.basename(input_image_path))[0]
                 refined_path = os.path.join(
@@ -533,19 +625,26 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
                 with open(refined_path, "wb") as refined_file:
                     refined_file.write(refined_mesh_bytes)
             else:
-                _run_hunyuan(input_image_path, coarse_mesh_path)
+                _run_hunyuan(
+                    input_image_path, coarse_mesh_path, slot["hunyuan_device"]
+                )
                 refined_path = _run_ultrashape(
-                    input_image_path, coarse_mesh_path, ULTRASHAPE_OUTPUT_DIR
+                    input_image_path,
+                    coarse_mesh_path,
+                    ULTRASHAPE_OUTPUT_DIR,
+                    slot["ultrashape_device"],
                 )
             backup_path = os.path.join(API_ROOT, "output.glb")
             shutil.copyfile(refined_path, backup_path)
             print(f"[api] backup saved: {backup_path}")
+        finally:
+            if not KEEP_INTERMEDIATE:
+                if os.path.exists(input_image_path):
+                    os.remove(input_image_path)
+                if os.path.exists(coarse_mesh_path):
+                    os.remove(coarse_mesh_path)
     finally:
-        if not KEEP_INTERMEDIATE:
-            if os.path.exists(input_image_path):
-                os.remove(input_image_path)
-            if os.path.exists(coarse_mesh_path):
-                os.remove(coarse_mesh_path)
+        _release_slot(slot)
 
     return refined_path
 
@@ -599,17 +698,25 @@ def _worker_loop() -> None:
 
 
 def _start_worker() -> None:
-    global WORKER_THREAD
-    if WORKER_THREAD and WORKER_THREAD.is_alive():
+    global WORKER_THREADS
+    if any(thread.is_alive() for thread in WORKER_THREADS):
         return
-    WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True)
-    WORKER_THREAD.start()
+    WORKER_THREADS = []
+    for idx in range(len(SLOTS)):
+        thread = threading.Thread(
+            target=_worker_loop,
+            daemon=True,
+            name=f"worker-{idx}",
+        )
+        thread.start()
+        WORKER_THREADS.append(thread)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     _ensure_dirs()
     _hot_start()
+    _init_slots()
     _start_worker()
 
 
