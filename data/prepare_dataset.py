@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import shutil
@@ -69,10 +70,58 @@ def make_uid(prefix: str, rel_path: Path) -> str:
     return f"{prefix}_{stem}_{digest}"
 
 
-def detect_tools():
+def is_executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def normalize_executable(path: Path, name: str) -> Path:
+    if path.is_dir():
+        return path / name
+    return path
+
+
+def resolve_tool(name: str, override=None, env_var=None, extra_paths=None):
+    if override:
+        candidate = normalize_executable(Path(override).expanduser(), name)
+        if is_executable(candidate):
+            return str(candidate)
+        raise SystemExit(f"{name} not found or not executable at {candidate}")
+
+    env_value = os.environ.get(env_var, "").strip() if env_var else ""
+    if env_value:
+        candidate = normalize_executable(Path(env_value).expanduser(), name)
+        if is_executable(candidate):
+            return str(candidate)
+        print(f"Warning: {env_var} set but not executable at {candidate}", file=sys.stderr)
+
+    found = shutil.which(name)
+    if found:
+        return found
+
+    for extra in extra_paths or []:
+        candidate = normalize_executable(extra, name)
+        if is_executable(candidate):
+            return str(candidate)
+    return None
+
+
+def detect_tools(repo_root: Path, args):
     return {
-        "gltfpack": shutil.which("gltfpack"),
-        "blender": shutil.which("blender"),
+        "gltfpack": resolve_tool(
+            "gltfpack",
+            args.gltfpack,
+            "GLTFPACK",
+            extra_paths=[
+                repo_root / "tools" / "gltfpack",
+                Path.home() / "tools" / "gltfpack",
+            ],
+        ),
+        "blender": resolve_tool(
+            "blender",
+            args.blender,
+            "BLENDER",
+            extra_paths=[Path("/usr/local/bin/blender")],
+        ),
     }
 
 
@@ -174,6 +223,8 @@ def main():
                         help="Artec3D downloads directory (relative to repo root).")
     parser.add_argument("--dataset-root", default="data/dataset",
                         help="Dataset output directory (relative to repo root).")
+    parser.add_argument("--gltfpack", help="Path to gltfpack binary (overrides PATH).")
+    parser.add_argument("--blender", help="Path to blender binary (overrides PATH).")
     parser.add_argument("--split", default="0.8,0.1,0.1", help="train,val,test split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for split.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
@@ -191,10 +242,17 @@ def main():
     render_root = dataset_root / "render"
 
     split = parse_split(args.split)
-    tools = detect_tools()
+    tools = detect_tools(repo_root, args)
 
     polycam_models = find_polycam_models(polycam_root)
     artec_models = find_generic_models(artec_root)
+
+    if not polycam_root.exists():
+        print(f"Polycam root missing: {polycam_root}")
+    if not artec_root.exists():
+        print(f"Artec root missing: {artec_root}")
+    print(f"Found {len(polycam_models)} Polycam models and {len(artec_models)} Artec models.")
+    print(f"Tools: gltfpack={tools['gltfpack'] or 'not found'}, blender={tools['blender'] or 'not found'}")
 
     sources = []
     for path in polycam_models:
