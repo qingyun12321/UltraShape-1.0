@@ -169,3 +169,5 @@ gradio_cache/
 #.idea/
 
 data/polycam-downloads/
+data/artec3d-downloads/
+data/dataset/
