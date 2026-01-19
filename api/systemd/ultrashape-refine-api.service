@@ -1,0 +1,20 @@
+[Unit]
+Description=UltraShape Refine API (remote services mode)
+After=network.target ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu2.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ultrashape/ultrashape.env
+Environment=ULTRASHAPE_ENV=ultrashape
+Environment=USE_REMOTE_SERVICES=1
+Environment=HUNYUAN_SERVICE_URLS=http://127.0.0.1:9084;http://127.0.0.1:9086
+Environment=ULTRASHAPE_SERVICE_URLS=http://127.0.0.1:9085;http://127.0.0.1:9087
+Environment=SERVICE_TIMEOUT=1200
+Environment=TASK_QUEUE_MAXSIZE=8
+WorkingDirectory=${ULTRASHAPE_ROOT}
+ExecStart=/bin/bash -lc 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/refine_api.py" --host 0.0.0.0 --port 10083'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
