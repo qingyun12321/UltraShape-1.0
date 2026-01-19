@@ -192,7 +192,7 @@ class ObjaverseDataset(Dataset):
 
         for sel_idx in indices:
             ret["sel_image_idx"] = sel_idx
-            img_path = f"{base_path}/{os.path.basename(base_path)}/rgba/{sel_idx:03d}.png"
+            img_path = f"{base_path}/{sel_idx:03d}.png"
             image = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
             if image is None or image.ndim != 3 or image.shape[2] < 4:
                 last_error = ValueError(f"Invalid image at {img_path}")

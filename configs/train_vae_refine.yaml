@@ -21,8 +21,8 @@ dataset:
     val_num_workers: 2
 
     # data
-    training_data_list: ../.objaverse/ultrashape_data/splits
-    sample_pcd_dir: ../.objaverse/ultrashape_data/sample
+    training_data_list: data/dataset
+    sample_pcd_dir: data/dataset/sample
 
     # input_pcd
     pc_size: &pc_size 65536

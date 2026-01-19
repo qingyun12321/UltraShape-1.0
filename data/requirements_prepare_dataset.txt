@@ -1,0 +1,4 @@
+# prepare_dataset.py has no Python package dependencies (stdlib only).
+# Optional external tools for mesh conversion:
+# - gltfpack (preferred for .gltf -> .glb)
+# - blender (required for .obj/.fbx/.dae/.ply/.stl, or .gltf fallback)

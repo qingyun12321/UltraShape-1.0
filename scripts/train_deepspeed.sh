@@ -35,6 +35,7 @@ num_gpu_per_node=$3
 master_ip=$4
 config=$5
 output_dir=$6
+extra_args=("${@:7}")
 
 echo node_num $node_num
 echo node_rank $node_rank
@@ -61,4 +62,5 @@ python3 main.py \
     --num_gpus $num_gpu_per_node \
     --config $config \
     --output_dir $output_dir \
-    --deepspeed
+    --deepspeed \
+    "${extra_args[@]}"

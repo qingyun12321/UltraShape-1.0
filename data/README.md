@@ -11,8 +11,9 @@ convert into GLB.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements_polycam_download.txt
 ```
+For dataset preparation, see `requirements_prepare_dataset.txt` (external tools).
 
 ## Run
 

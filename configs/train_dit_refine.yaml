@@ -22,9 +22,9 @@ dataset:
     val_num_workers: 4
 
     # data
-    training_data_list: ../.objaverse/ultrashape_data/splits
-    sample_pcd_dir: ../.objaverse/ultrashape_data/sample
-    image_data_json: ../.objaverse/ultrashape_data/render.json
+    training_data_list: data/dataset
+    sample_pcd_dir: data/dataset/sample
+    image_data_json: data/dataset/render.json
 
     # image
     image_size: &image_size 384
