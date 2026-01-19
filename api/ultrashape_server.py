@@ -18,7 +18,7 @@ ULTRASHAPE_ROOT = os.path.abspath(os.path.join(API_ROOT, ".."))
 if ULTRASHAPE_ROOT not in sys.path:
     sys.path.insert(0, ULTRASHAPE_ROOT)
 
-ULTRASHAPE_VISIBLE_DEVICES = os.environ.get("ULTRASHAPE_CUDA_VISIBLE_DEVICES", "5")
+ULTRASHAPE_VISIBLE_DEVICES = os.environ.get("ULTRASHAPE_CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", ULTRASHAPE_VISIBLE_DEVICES)
 
