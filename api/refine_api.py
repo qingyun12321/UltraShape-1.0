@@ -61,13 +61,12 @@ ULTRASHAPE_CUDA_VISIBLE_DEVICES = os.environ.get(
     "ULTRASHAPE_CUDA_VISIBLE_DEVICES", "0"
 )
 ULTRASHAPE_OCTREE_RES = os.environ.get("ULTRASHAPE_OCTREE_RES", "512")
-ULTRASHAPE_STEPS = os.environ.get("ULTRASHAPE_STEPS", "30")
+ULTRASHAPE_STEPS = os.environ.get("ULTRASHAPE_STEPS", "12")
 PYTORCH_CUDA_ALLOC_CONF = os.environ.get(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
 )
 ULTRASHAPE_OOM_RETRY = os.environ.get("ULTRASHAPE_OOM_RETRY", "1") == "1"
 ULTRASHAPE_OOM_OCTREE_RES = os.environ.get("ULTRASHAPE_OOM_OCTREE_RES", "384")
-ULTRASHAPE_OOM_STEPS = os.environ.get("ULTRASHAPE_OOM_STEPS", "20")
 CONDA_EXE = os.environ.get("CONDA_EXE", "conda")
 CONDA_SH = os.environ.get("CONDA_SH")
 HOT_START_ENABLED = os.environ.get("HOT_START_ENABLED", "1") == "1"
@@ -587,11 +586,9 @@ def _run_ultrashape(
         if ULTRASHAPE_OOM_RETRY and "out of memory" in details.lower():
             retry_env = env.copy()
             retry_env["ULTRASHAPE_OCTREE_RES"] = str(ULTRASHAPE_OOM_OCTREE_RES)
-            retry_env["ULTRASHAPE_STEPS"] = str(ULTRASHAPE_OOM_STEPS)
             print(
                 "[ultrashape] OOM detected, retrying with "
-                f"octree_res={retry_env['ULTRASHAPE_OCTREE_RES']} "
-                f"steps={retry_env['ULTRASHAPE_STEPS']}"
+                f"octree_res={retry_env['ULTRASHAPE_OCTREE_RES']}"
             )
             result = _run_once(retry_env, "oom-retry")
             if result.returncode != 0:

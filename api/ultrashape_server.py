@@ -36,8 +36,13 @@ CKPT_PATH = os.environ.get(
 CONFIG_PATH = os.environ.get(
     "ULTRASHAPE_CONFIG", os.path.join(ULTRASHAPE_ROOT, "configs", "infer_dit_refine.yaml")
 )
-DEFAULT_STEPS = int(os.environ.get("ULTRASHAPE_STEPS", "30"))
+DEFAULT_STEPS = int(os.environ.get("ULTRASHAPE_STEPS", "12"))
 DEFAULT_OCTREE_RES = int(os.environ.get("ULTRASHAPE_OCTREE_RES", "512"))
+LOAD_ON_STARTUP = os.environ.get("ULTRASHAPE_LOAD_ON_STARTUP", "1") == "1"
+LAZY_REMBG = os.environ.get("ULTRASHAPE_LAZY_REMBG", "1") == "1"
+STAGED_EXPORT = os.environ.get("ULTRASHAPE_STAGED_EXPORT", "1") == "1"
+IDLE_OFFLOAD_SECS = float(os.environ.get("ULTRASHAPE_IDLE_OFFLOAD_SECS", "60"))
+KEEP_ON_GPU_RAW = os.environ.get("ULTRASHAPE_KEEP_ON_GPU", "model,conditioner")
 
 PIPELINE: Optional[UltraShapePipeline] = None
 PIPELINE_LOCK = threading.Lock()
@@ -46,6 +51,8 @@ REMBG: Optional[BackgroundRemover] = None
 TOKEN_NUM: Optional[int] = None
 VOXEL_RES: Optional[int] = None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IDLE_OFFLOAD_TIMER: Optional[threading.Timer] = None
+IDLE_OFFLOAD_LOCK = threading.Lock()
 
 app = FastAPI(title="UltraShape Refine Service")
 
@@ -69,6 +76,90 @@ def _decode_base64(data: str) -> bytes:
     if "," in data:
         data = data.split(",", 1)[1]
     return base64.b64decode(data)
+
+
+def _parse_keep_on_gpu(value: str) -> set:
+    value = (value or "").strip().lower()
+    if not value or value == "all":
+        return {"model", "vae", "conditioner"}
+    if value == "none":
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+KEEP_ON_GPU = _parse_keep_on_gpu(KEEP_ON_GPU_RAW)
+
+
+def _cancel_idle_offload() -> None:
+    global IDLE_OFFLOAD_TIMER
+    if IDLE_OFFLOAD_SECS <= 0:
+        return
+    with IDLE_OFFLOAD_LOCK:
+        if IDLE_OFFLOAD_TIMER is not None:
+            IDLE_OFFLOAD_TIMER.cancel()
+            IDLE_OFFLOAD_TIMER = None
+
+
+def _offload_pipeline_components(keep_on_gpu: set) -> None:
+    if PIPELINE is None or DEVICE.type != "cuda":
+        return
+    if keep_on_gpu == {"model", "vae", "conditioner"}:
+        return
+    if not keep_on_gpu:
+        PIPELINE.to("cpu")
+    else:
+        components = {
+            "model": PIPELINE.model,
+            "vae": PIPELINE.vae,
+            "conditioner": PIPELINE.conditioner,
+        }
+        for name, module in components.items():
+            if name in keep_on_gpu:
+                module.to(DEVICE)
+            else:
+                module.to("cpu")
+    torch.cuda.empty_cache()
+
+
+def _schedule_idle_offload() -> None:
+    global IDLE_OFFLOAD_TIMER
+    if IDLE_OFFLOAD_SECS <= 0:
+        return
+
+    def _do_offload() -> None:
+        if PIPELINE is None or DEVICE.type != "cuda":
+            return
+        if not PIPELINE_LOCK.acquire(blocking=False):
+            _schedule_idle_offload()
+            return
+        try:
+            _offload_pipeline_components(KEEP_ON_GPU)
+        finally:
+            PIPELINE_LOCK.release()
+
+    with IDLE_OFFLOAD_LOCK:
+        if IDLE_OFFLOAD_TIMER is not None:
+            IDLE_OFFLOAD_TIMER.cancel()
+        IDLE_OFFLOAD_TIMER = threading.Timer(IDLE_OFFLOAD_SECS, _do_offload)
+        IDLE_OFFLOAD_TIMER.daemon = True
+        IDLE_OFFLOAD_TIMER.start()
+
+
+def _offload_after_diffusion() -> None:
+    if PIPELINE is None or DEVICE.type != "cuda":
+        return
+    PIPELINE.model.to("cpu")
+    PIPELINE.conditioner.to("cpu")
+    torch.cuda.empty_cache()
+
+
+def _restore_after_export() -> None:
+    if PIPELINE is None or DEVICE.type != "cuda":
+        return
+    if "model" in KEEP_ON_GPU:
+        PIPELINE.model.to(DEVICE)
+    if "conditioner" in KEEP_ON_GPU:
+        PIPELINE.conditioner.to(DEVICE)
 
 
 def _load_models() -> Tuple[UltraShapePipeline, int, int, SharpEdgeSurfaceLoader]:
@@ -114,7 +205,9 @@ def _ensure_models() -> None:
     if PIPELINE is not None:
         return
     PIPELINE, TOKEN_NUM, VOXEL_RES, LOADER = _load_models()
-    REMBG = BackgroundRemover()
+    if not LAZY_REMBG:
+        REMBG = BackgroundRemover()
+    _schedule_idle_offload()
 
 
 def _write_temp_glb(data: bytes) -> str:
@@ -139,7 +232,8 @@ def _mesh_to_base64(mesh) -> str:
 
 @app.on_event("startup")
 def _startup() -> None:
-    _ensure_models()
+    if LOAD_ON_STARTUP:
+        _ensure_models()
 
 
 @app.get("/health")
@@ -149,6 +243,7 @@ def health_check():
 
 @app.post("/refine", response_model=RefineResponse)
 def refine(req: RefineRequest):
+    _ensure_models()
     if PIPELINE is None or LOADER is None or TOKEN_NUM is None or VOXEL_RES is None:
         raise HTTPException(status_code=500, detail="Pipeline not initialized")
 
@@ -165,20 +260,26 @@ def refine(req: RefineRequest):
         raise HTTPException(status_code=400, detail=f"Invalid mesh base64: {exc}") from exc
 
     remove_bg = bool(req.remove_bg) or image.mode != "RGBA"
-    if remove_bg and REMBG is not None:
+    if remove_bg:
+        global REMBG
+        if REMBG is None:
+            REMBG = BackgroundRemover()
         image = REMBG(image)
 
     mesh_path = _write_temp_glb(mesh_bytes)
     steps = int(req.steps or DEFAULT_STEPS)
     octree_res = int(req.octree_res or DEFAULT_OCTREE_RES)
 
+    _cancel_idle_offload()
     try:
         with PIPELINE_LOCK:
+            PIPELINE.to(DEVICE)
             surface = LOADER(mesh_path, normalize_scale=req.scale).to(
                 DEVICE, dtype=torch.float16
             )
             pc = surface[:, :, :3]
             _, voxel_idx = voxelize_from_point(pc, TOKEN_NUM, resolution=VOXEL_RES)
+            del surface, pc
 
             generator = torch.Generator(DEVICE).manual_seed(int(req.seed or 42))
             with torch.no_grad():
@@ -189,20 +290,47 @@ def refine(req: RefineRequest):
                 else:
                     autocast_ctx = contextlib.nullcontext()
                 with autocast_ctx:
-                    mesh, _ = PIPELINE(
-                        image=image,
-                        voxel_cond=voxel_idx,
-                        generator=generator,
-                        box_v=1.0,
-                        mc_level=0.0,
-                        octree_resolution=octree_res,
-                        num_inference_steps=steps,
-                    )
+                    if STAGED_EXPORT and DEVICE.type == "cuda":
+                        latents, _ = PIPELINE(
+                            image=image,
+                            voxel_cond=voxel_idx,
+                            generator=generator,
+                            box_v=1.0,
+                            mc_level=0.0,
+                            octree_resolution=octree_res,
+                            num_inference_steps=steps,
+                            num_chunks=2048,
+                            output_type="latent",
+                        )
+                        _offload_after_diffusion()
+                        mesh = PIPELINE._export(
+                            latents,
+                            output_type="trimesh",
+                            box_v=1.0,
+                            mc_level=0.0,
+                            num_chunks=2048,
+                            octree_resolution=octree_res,
+                            mc_algo=None,
+                            enable_pbar=True,
+                        )
+                        _restore_after_export()
+                    else:
+                        mesh, _ = PIPELINE(
+                            image=image,
+                            voxel_cond=voxel_idx,
+                            generator=generator,
+                            box_v=1.0,
+                            mc_level=0.0,
+                            octree_resolution=octree_res,
+                            num_inference_steps=steps,
+                            num_chunks=2048,
+                        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         if os.path.exists(mesh_path):
             os.remove(mesh_path)
+        _schedule_idle_offload()
 
     mesh_base64 = _mesh_to_base64(mesh[0])
     return {"status": "success", "mesh_base64": mesh_base64}

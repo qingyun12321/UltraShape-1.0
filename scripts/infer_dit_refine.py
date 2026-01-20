@@ -73,7 +73,7 @@ def run_inference(args):
     if args.low_vram:
         pipeline.enable_model_cpu_offload()
 
-    token_num = args.num_latents
+    token_num = args.num_latents or config.model.params.vae_config.params.num_latents
     voxel_res = config.model.params.vae_config.params.voxel_query_res
     
     print(f"Initializing Surface Loader (Token Num: {token_num})...")
@@ -129,10 +129,10 @@ if __name__ == "__main__":
     parser.add_argument("--mesh", type=str, required=True, help="Input coarse mesh (.glb/.obj)")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory")
     
-    parser.add_argument("--steps", type=int, default=50, help="Inference steps")
+    parser.add_argument("--steps", type=int, default=12, help="Inference steps")
     parser.add_argument("--scale", type=float, default=0.99, help="Mesh normalization scale")
-    parser.add_argument("--num_latents", type=int, default=32768, help="Number of latents")
-    parser.add_argument("--chunk_size", type=int, default=8000, help="Chunk size for inference")
+    parser.add_argument("--num_latents", type=int, default=None, help="Override latent count from config")
+    parser.add_argument("--chunk_size", type=int, default=2048, help="Chunk size for inference")
     parser.add_argument("--octree_res", type=int, default=1024, help="Marching Cubes resolution")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--remove_bg", action="store_true", help="Force remove background")
