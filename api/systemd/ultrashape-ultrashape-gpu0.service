@@ -9,8 +9,8 @@ Environment=ULTRASHAPE_ENV=ultrashape
 Environment=ULTRASHAPE_CUDA_VISIBLE_DEVICES=0
 Environment=ULTRASHAPE_SERVICE_HOST=0.0.0.0
 Environment=ULTRASHAPE_SERVICE_PORT=9085
-WorkingDirectory=${ULTRASHAPE_ROOT}
-ExecStart=/bin/bash -lc 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/ultrashape_server.py"'
+WorkingDirectory=__ULTRASHAPE_ROOT__
+ExecStart=/bin/bash -c 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/ultrashape_server.py"'
 Restart=on-failure
 RestartSec=3
 

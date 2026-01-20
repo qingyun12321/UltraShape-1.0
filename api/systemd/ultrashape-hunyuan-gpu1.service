@@ -9,8 +9,8 @@ Environment=HUNYUAN_ENV=anta3d
 Environment=HUNYUAN_CUDA_VISIBLE_DEVICES=1
 Environment=HUNYUAN_SERVICE_HOST=0.0.0.0
 Environment=HUNYUAN_SERVICE_PORT=9084
-WorkingDirectory=${HUNYUAN_ROOT}
-ExecStart=/bin/bash -lc 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${HUNYUAN_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${HUNYUAN_ROOT}/api/hunyuan_server.py"'
+WorkingDirectory=__HUNYUAN_ROOT__
+ExecStart=/bin/bash -c 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${HUNYUAN_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${HUNYUAN_ROOT}/api/hunyuan_server.py"'
 Restart=on-failure
 RestartSec=3
 

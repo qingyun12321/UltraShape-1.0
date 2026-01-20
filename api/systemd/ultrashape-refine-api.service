@@ -11,8 +11,8 @@ Environment=HUNYUAN_SERVICE_URLS=http://127.0.0.1:9084;http://127.0.0.1:9086
 Environment=ULTRASHAPE_SERVICE_URLS=http://127.0.0.1:9085;http://127.0.0.1:9087
 Environment=SERVICE_TIMEOUT=1200
 Environment=TASK_QUEUE_MAXSIZE=8
-WorkingDirectory=${ULTRASHAPE_ROOT}
-ExecStart=/bin/bash -lc 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/refine_api.py" --host 0.0.0.0 --port 10083'
+WorkingDirectory=__ULTRASHAPE_ROOT__
+ExecStart=/bin/bash -c 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/refine_api.py" --host 0.0.0.0 --port 10083'
 Restart=on-failure
 RestartSec=3
 
