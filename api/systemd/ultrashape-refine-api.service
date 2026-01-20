@@ -1,14 +1,14 @@
 [Unit]
 Description=UltraShape Refine API (remote services mode)
-After=network.target ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu2.service
+After=network.target ultrashape-hunyuan-gpu0.service ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu2.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu1.service ultrashape-ultrashape-gpu2.service ultrashape-ultrashape-gpu3.service
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/ultrashape/ultrashape.env
 Environment=ULTRASHAPE_ENV=ultrashape
 Environment=USE_REMOTE_SERVICES=1
-Environment=HUNYUAN_SERVICE_URLS=http://127.0.0.1:9084;http://127.0.0.1:9086
-Environment=ULTRASHAPE_SERVICE_URLS=http://127.0.0.1:9085;http://127.0.0.1:9087
+Environment=HUNYUAN_SERVICE_URLS=http://127.0.0.1:9084;http://127.0.0.1:9086;http://127.0.0.1:9088;http://127.0.0.1:9090
+Environment=ULTRASHAPE_SERVICE_URLS=http://127.0.0.1:9085;http://127.0.0.1:9087;http://127.0.0.1:9089;http://127.0.0.1:9091
 Environment=SERVICE_TIMEOUT=1200
 Environment=TASK_QUEUE_MAXSIZE=8
 WorkingDirectory=__ULTRASHAPE_ROOT__

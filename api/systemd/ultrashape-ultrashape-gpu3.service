@@ -1,14 +1,14 @@
 [Unit]
-Description=UltraShape Refine Service (GPU 2, port 9089)
+Description=UltraShape Refine Service (GPU 3, port 9091)
 After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/ultrashape/ultrashape.env
 Environment=ULTRASHAPE_ENV=ultrashape
-Environment=ULTRASHAPE_CUDA_VISIBLE_DEVICES=2
+Environment=ULTRASHAPE_CUDA_VISIBLE_DEVICES=3
 Environment=ULTRASHAPE_SERVICE_HOST=0.0.0.0
-Environment=ULTRASHAPE_SERVICE_PORT=9089
+Environment=ULTRASHAPE_SERVICE_PORT=9091
 WorkingDirectory=__ULTRASHAPE_ROOT__
 ExecStart=/bin/bash -c 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${ULTRASHAPE_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${ULTRASHAPE_ROOT}/api/ultrashape_server.py"'
 Restart=on-failure

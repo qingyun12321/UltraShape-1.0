@@ -1,7 +1,7 @@
 [Unit]
 Description=UltraShape Stack (remote services mode)
-Wants=ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu2.service ultrashape-refine-api.service
-After=network.target ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu2.service ultrashape-refine-api.service
+Wants=ultrashape-hunyuan-gpu0.service ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu2.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu1.service ultrashape-ultrashape-gpu2.service ultrashape-ultrashape-gpu3.service ultrashape-refine-api.service
+After=network.target ultrashape-hunyuan-gpu0.service ultrashape-hunyuan-gpu1.service ultrashape-hunyuan-gpu2.service ultrashape-hunyuan-gpu3.service ultrashape-ultrashape-gpu0.service ultrashape-ultrashape-gpu1.service ultrashape-ultrashape-gpu2.service ultrashape-ultrashape-gpu3.service ultrashape-refine-api.service
 
 [Service]
 Type=oneshot

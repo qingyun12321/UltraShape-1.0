@@ -1,5 +1,5 @@
 [Unit]
-Description=UltraShape Hunyuan Service (GPU 3, port 9086)
+Description=UltraShape Hunyuan Service (GPU 3, port 9090)
 After=network.target
 
 [Service]
@@ -8,7 +8,7 @@ EnvironmentFile=-/etc/ultrashape/ultrashape.env
 Environment=HUNYUAN_ENV=anta3d
 Environment=HUNYUAN_CUDA_VISIBLE_DEVICES=3
 Environment=HUNYUAN_SERVICE_HOST=0.0.0.0
-Environment=HUNYUAN_SERVICE_PORT=9086
+Environment=HUNYUAN_SERVICE_PORT=9090
 WorkingDirectory=__HUNYUAN_ROOT__
 ExecStart=/bin/bash -c 'set -e; if [ -n "${CONDA_SH:-}" ]; then source "${CONDA_SH}"; conda activate "${HUNYUAN_ENV}"; fi; exec "${PYTHON_BIN:-python3}" "${HUNYUAN_ROOT}/api/hunyuan_server.py"'
 Restart=on-failure

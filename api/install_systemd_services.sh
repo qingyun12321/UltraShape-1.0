@@ -54,10 +54,14 @@ render_unit() {
 }
 
 render_unit "${SYSTEMD_SRC}/ultrashape.env" "${ENV_DIR}/ultrashape.env"
+render_unit "${SYSTEMD_SRC}/ultrashape-hunyuan-gpu0.service" "${SYSTEMD_DIR}/ultrashape-hunyuan-gpu0.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-hunyuan-gpu1.service" "${SYSTEMD_DIR}/ultrashape-hunyuan-gpu1.service"
+render_unit "${SYSTEMD_SRC}/ultrashape-hunyuan-gpu2.service" "${SYSTEMD_DIR}/ultrashape-hunyuan-gpu2.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-hunyuan-gpu3.service" "${SYSTEMD_DIR}/ultrashape-hunyuan-gpu3.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-ultrashape-gpu0.service" "${SYSTEMD_DIR}/ultrashape-ultrashape-gpu0.service"
+render_unit "${SYSTEMD_SRC}/ultrashape-ultrashape-gpu1.service" "${SYSTEMD_DIR}/ultrashape-ultrashape-gpu1.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-ultrashape-gpu2.service" "${SYSTEMD_DIR}/ultrashape-ultrashape-gpu2.service"
+render_unit "${SYSTEMD_SRC}/ultrashape-ultrashape-gpu3.service" "${SYSTEMD_DIR}/ultrashape-ultrashape-gpu3.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-refine-api.service" "${SYSTEMD_DIR}/ultrashape-refine-api.service"
 render_unit "${SYSTEMD_SRC}/ultrashape-stack.service" "${SYSTEMD_DIR}/ultrashape-stack.service"
 
