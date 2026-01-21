@@ -2,21 +2,30 @@ name: "UltraShape Refine VAE"
 
 training:
   # ckpt_path:
-  steps: 620
+  steps: 1150
   use_amp: true
   amp_type: "bf16"
   base_lr: 1e-5
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  every_n_train_steps: 100
-  val_check_interval: 100
-  log_every_n_steps: 20
-  limit_val_batches: 0
+  every_n_train_steps: 23
+  val_check_interval: 23
+  log_every_n_steps: 10
+  limit_val_batches: 1.0
+
+callbacks:
+  early_stop:
+    target: pytorch_lightning.callbacks.EarlyStopping
+    params:
+      monitor: "val/total_loss"
+      mode: "min"
+      patience: 5
+      min_delta: 0.0
 
 dataset:
   target: ultrashape.data.objaverse_vae.ObjaverseDataModule
   params:
-    batch_size: 1
+    batch_size: 4
     num_workers: 2
     val_num_workers: 2
 

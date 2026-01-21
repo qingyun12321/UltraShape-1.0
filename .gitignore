@@ -170,4 +170,7 @@ gradio_cache/
 
 data/polycam-downloads/
 data/artec3d-downloads/
-data/dataset/
+data/dataset/meshes
+data/dataset/render
+data/dataset/sample
+outputs/
