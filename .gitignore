@@ -174,3 +174,4 @@ data/dataset/meshes
 data/dataset/render
 data/dataset/sample
 outputs/
+cache/

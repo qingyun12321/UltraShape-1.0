@@ -5,12 +5,28 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT_DIR"
 
 NODE_RANK="${1:-0}"
-MASTER_IP="${2:-127.0.0.1}"
+MASTER_IP="${2:-}"
 shift $(( $# > 1 ? 2 : $# ))
 EXTRA_ARGS=("$@")
 
 VAE_CKPT_DIR="${VAE_CKPT_DIR:-outputs/vae_ultrashape/exp1_token8192/ckpt}"
 DIT_CONFIG="${DIT_CONFIG:-configs/train_dit_refine.yaml}"
+
+detect_master_ip() {
+  local ip=""
+  ip="$(ip -o -4 route show to default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="127.0.0.1"
+  fi
+  echo "$ip"
+}
+
+if [[ -z "$MASTER_IP" || "$MASTER_IP" == "127.0.0.1" ]]; then
+  MASTER_IP="$(detect_master_ip)"
+fi
 
 echo "[train_all] Start VAE training..."
 bash train.sh vae "$NODE_RANK" "$MASTER_IP" "${EXTRA_ARGS[@]}"
