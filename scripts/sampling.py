@@ -42,6 +42,69 @@ def load_mesh(mesh_path: str, device: str = "cuda") -> Tuple[torch.Tensor, torch
         raise ValueError(f"too many faces {faces.shape}")
     return vertices, faces
 
+def resolve_root_dir(root_dir: Optional[str] = None) -> str:
+    if root_dir:
+        return os.path.abspath(root_dir)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def resolve_path(path: str, root_dir: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(root_dir, path))
+
+def collect_mesh_paths(
+    mesh_dir: str,
+    mesh_exts: Tuple[str, ...],
+    recursive: bool = False
+) -> List[str]:
+    mesh_paths: List[str] = []
+    if recursive:
+        for root, _, files in os.walk(mesh_dir):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in mesh_exts:
+                    mesh_paths.append(os.path.join(root, name))
+    else:
+        for name in os.listdir(mesh_dir):
+            path = os.path.join(mesh_dir, name)
+            if not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in mesh_exts:
+                mesh_paths.append(path)
+    return sorted(mesh_paths)
+
+def resolve_mesh_paths(
+    mesh_json: Optional[str],
+    mesh_dir: Optional[str],
+    mesh_exts: Tuple[str, ...],
+    recursive: bool,
+    root_dir: str
+) -> List[str]:
+    if mesh_json:
+        mesh_json = resolve_path(mesh_json, root_dir)
+        with open(mesh_json, "r") as f:
+            mesh_paths = json.load(f)
+        if not isinstance(mesh_paths, list):
+            raise ValueError(f"mesh_json must be a list of paths: {mesh_json}")
+    elif mesh_dir:
+        mesh_dir = resolve_path(mesh_dir, root_dir)
+        if not os.path.isdir(mesh_dir):
+            raise FileNotFoundError(f"mesh_dir not found: {mesh_dir}")
+        mesh_paths = collect_mesh_paths(mesh_dir, mesh_exts, recursive=recursive)
+    else:
+        raise ValueError("Either mesh_json or mesh_dir must be provided")
+
+    if not mesh_paths:
+        raise ValueError("No mesh files found for sampling")
+
+    resolved_paths: List[str] = []
+    for path in mesh_paths:
+        if not isinstance(path, str):
+            raise ValueError("mesh paths must be strings")
+        resolved_paths.append(resolve_path(path, root_dir))
+    return resolved_paths
+
 def compute_mesh_features(vertices: torch.Tensor, faces: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     device = vertices.device
     
@@ -441,9 +504,8 @@ def process_single_mesh(
              scale=scale.cpu().numpy())
 
 class MeshDataset(Dataset):
-    def __init__(self, mesh_json: str):
-        with open(mesh_json, "r") as f:
-            self.mesh_paths = json.load(f)
+    def __init__(self, mesh_paths: List[str]):
+        self.mesh_paths = mesh_paths
         # print(len(self.mesh_paths))
             
     def __len__(self) -> int:
@@ -460,7 +522,7 @@ class MeshDataset(Dataset):
 class MeshProcessor(pl.LightningModule):
     def __init__(
         self,
-        mesh_json: str,
+        mesh_paths: List[str],
         output_dir: str,
         data_type:str,
         surface_uniform_samples: int = 20000,
@@ -471,7 +533,8 @@ class MeshProcessor(pl.LightningModule):
         num_workers: int = 4
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["mesh_paths"])
+        self.mesh_paths = mesh_paths
         os.makedirs(output_dir, exist_ok=True)
     
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> STEP_OUTPUT:
@@ -516,8 +579,7 @@ class MeshProcessor(pl.LightningModule):
                 }
 
     def predict_dataloader(self) -> DataLoader:
-        dataset = MeshDataset(
-            self.hparams.mesh_json)
+        dataset = MeshDataset(self.mesh_paths)
         return DataLoader(
             dataset,
             batch_size=self.hparams.batch_size,
@@ -527,7 +589,7 @@ class MeshProcessor(pl.LightningModule):
         )
 
 def process_mesh_directory(
-    mesh_json: str,
+    mesh_paths: List[str],
     output_dir: str,
     data_type: str,
     surface_uniform_samples: int = 100000,
@@ -539,7 +601,7 @@ def process_mesh_directory(
     num_workers: int = 4
 ) -> None:
     model = MeshProcessor(
-        mesh_json=mesh_json,
+        mesh_paths=mesh_paths,
         output_dir=output_dir,
         data_type=data_type,
         surface_uniform_samples=surface_uniform_samples,
@@ -578,8 +640,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Process Mesh Directory for Sampling")
 
-    parser.add_argument("--mesh_json", type=str, default="test_mesh.json", help="Path to the mesh json file")
-    parser.add_argument("--output_dir", type=str, default="ultrashape_test1", help="Directory to save outputs")
+    parser.add_argument("--mesh_json", type=str, default=None, help="Path to the mesh json file (overrides mesh_dir)")
+    parser.add_argument("--mesh_dir", type=str, default="data/dataset/meshes", help="Directory containing mesh files")
+    parser.add_argument("--mesh_exts", type=str, default=".glb,.obj,.ply,.stl,.off,.npz", help="Comma-separated mesh extensions")
+    parser.add_argument("--recursive", action="store_true", help="Recursively scan mesh_dir")
+    parser.add_argument("--root_dir", type=str, default=None, help="Base directory for relative mesh paths")
+    parser.add_argument("--output_dir", type=str, default="data/dataset/sample", help="Directory to save outputs")
 
     parser.add_argument("--surface_uniform_samples", type=int, default=300000, help="Number of uniform samples on surface")
     parser.add_argument("--surface_curvature_samples", type=int, default=300000, help="Number of curvature-based samples on surface")
@@ -593,8 +659,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # print(f"Arguments: {args}")
 
-    process_mesh_directory(
+    root_dir = resolve_root_dir(args.root_dir)
+    mesh_exts = tuple(ext.strip().lower() for ext in args.mesh_exts.split(",") if ext.strip())
+    mesh_paths = resolve_mesh_paths(
         mesh_json=args.mesh_json,
+        mesh_dir=args.mesh_dir,
+        mesh_exts=mesh_exts,
+        recursive=args.recursive,
+        root_dir=root_dir
+    )
+    print(f"[Info] Found {len(mesh_paths)} mesh files for sampling")
+
+    process_mesh_directory(
+        mesh_paths=mesh_paths,
         output_dir=args.output_dir,
         data_type='mesh',
         surface_uniform_samples=args.surface_uniform_samples,
