@@ -2,7 +2,7 @@ name: "UltraShape Refine DiT"
 
 training:
   # ckpt_path:
-  steps: 1150
+  steps: 4600
   use_amp: true
   amp_type: "bf16"
   base_lr: 1e-5
@@ -56,7 +56,7 @@ model:
 
     vae_config:
       target: ultrashape.models.autoencoders.ShapeVAE
-      from_pretrained: outputs/vae_ultrashape/exp1/ckpt/ckpt-step=00000600.ckpt
+      from_pretrained: outputs/vae_ultrashape/exp1_token8192/ckpt/ckpt-step=00000989.ckpt
       params:
         num_latents: &num_latents 2048
         embed_dim: 64

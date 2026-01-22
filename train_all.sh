@@ -45,8 +45,8 @@ fi
 LATEST_CKPT="${CKPTS[0]}"
 LATEST_REL="$(python3 - <<PY
 import os
-root = r\"$ROOT_DIR\"
-ckpt = r\"$LATEST_CKPT\"
+root = r"$ROOT_DIR"
+ckpt = r"$LATEST_CKPT"
 print(os.path.relpath(ckpt, root))
 PY
 )"
@@ -54,25 +54,25 @@ PY
 python3 - <<PY
 import io
 
-path = r\"$DIT_CONFIG\"
-new_ckpt = r\"$LATEST_REL\"
+path = r"$DIT_CONFIG"
+new_ckpt = r"$LATEST_REL"
 
-with open(path, \"r\", encoding=\"utf-8\") as f:
+with open(path, "r", encoding="utf-8") as f:
     lines = f.read().splitlines()
 
 updated = False
 for i, line in enumerate(lines):
-    if \"from_pretrained:\" in line:
-        indent = line.split(\"from_pretrained:\")[0]
-        lines[i] = f\"{indent}from_pretrained: {new_ckpt}\"
+    if "from_pretrained:" in line:
+        indent = line.split("from_pretrained:")[0]
+        lines[i] = f"{indent}from_pretrained: {new_ckpt}"
         updated = True
         break
 
 if not updated:
-    raise SystemExit(f\"from_pretrained not found in {path}\")
+    raise SystemExit(f"from_pretrained not found in {path}")
 
-with open(path, \"w\", encoding=\"utf-8\") as f:
-    f.write(\"\\n\".join(lines) + \"\\n\")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\\n".join(lines) + "\\n")
 PY
 
 echo "[train_all] Updated $DIT_CONFIG -> from_pretrained: $LATEST_REL"

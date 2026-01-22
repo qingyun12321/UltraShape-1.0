@@ -103,8 +103,15 @@ def instantiate_vae_from_config_local(config, **kwargs):
             key=os.path.getmtime,
         )
         if not candidates:
-            raise FileNotFoundError(f"No .ckpt files found in {ckpt_path}")
-        ckpt_path = candidates[-1]
+            ds_candidates = sorted(
+                glob.glob(os.path.join(ckpt_path, "checkpoint", "*_model_states.pt")),
+                key=os.path.getmtime,
+            )
+            if not ds_candidates:
+                raise FileNotFoundError(f"No .ckpt or deepspeed model states found in {ckpt_path}")
+            ckpt_path = ds_candidates[-1]
+        else:
+            ckpt_path = candidates[-1]
             
     logger.info(f"Loading model from {ckpt_path}")
     if not os.path.exists(ckpt_path):
@@ -130,20 +137,24 @@ def instantiate_vae_from_config_local(config, **kwargs):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     if 'state_dict' not in ckpt:
-        # deepspeed ckpt
-        state_dict = {}
-        for k in ckpt.keys():
-            new_k = k.replace('vae_model.', '')
-            state_dict[new_k] = ckpt[k]
+        # Deepspeed checkpoints store weights under "module".
+        if isinstance(ckpt, dict) and "module" in ckpt and isinstance(ckpt["module"], dict):
+            state_dict = ckpt["module"]
+        else:
+            state_dict = {}
+            for k in ckpt.keys():
+                new_k = k.replace('vae_model.', '')
+                state_dict[new_k] = ckpt[k]
     else:
         state_dict = ckpt["state_dict"]
-        # Normalize common prefixes from Lightning checkpoints.
-        prefixes = ("vae_model.", "model.", "first_stage_model.")
-        for prefix in prefixes:
-            if all(k.startswith(prefix) for k in state_dict.keys()):
-                state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
-                logger.info(f"Stripped state_dict prefix '{prefix}'")
-                break
+
+    # Normalize common prefixes from checkpoints.
+    prefixes = ("vae_model.", "model.", "first_stage_model.")
+    for prefix in prefixes:
+        if all(k.startswith(prefix) for k in state_dict.keys()):
+            state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
+            logger.info(f"Stripped state_dict prefix '{prefix}'")
+            break
 
     params = config.get("params", dict())
     kwargs.update(params)
