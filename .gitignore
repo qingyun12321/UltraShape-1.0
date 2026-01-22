@@ -175,3 +175,4 @@ data/dataset/render
 data/dataset/sample
 outputs/
 cache/
+checkpoints/ultrashape_v1.pt
