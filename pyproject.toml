@@ -61,11 +61,11 @@ torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 cubvh = { git = "https://github.com/ashawkey/cubvh.git" }
 pytorch3d = { git = "https://github.com/facebookresearch/pytorch3d.git", rev = "stable" }
-torch-cluster = { url = "https://data.pyg.org/whl/torch-2.5.0%2Bcu121/torch_cluster-1.6.3%2Bpt25cu121-cp310-cp310-linux_x86_64.whl" }
+torch-cluster = { url = "https://data.pyg.org/whl/torch-2.5.0%2Bcu124/torch_cluster-1.6.3%2Bpt25cu124-cp310-cp310-linux_x86_64.whl" }
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu121"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv.extra-build-dependencies]
