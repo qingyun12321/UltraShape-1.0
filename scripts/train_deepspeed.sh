@@ -58,6 +58,18 @@ export MASTER_PORT=${MASTER_PORT:-12348}
 echo "[train_deepspeed] MASTER_ADDR=${MASTER_ADDR}"
 echo "[train_deepspeed] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
 
+# Prefer venv python when available.
+python_exec="python3"
+if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    python_exec="${VIRTUAL_ENV}/bin/python"
+else
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -x "${script_dir}/../.venv/bin/python" ]]; then
+        python_exec="${script_dir}/../.venv/bin/python"
+    fi
+fi
+echo "[train_deepspeed] PYTHON_EXEC=${python_exec}"
+
 if test -d "$output_dir"; then
     cp $config $output_dir
 else
@@ -67,7 +79,7 @@ fi
 
 NODE_RANK=$node_rank \
 HF_HUB_OFFLINE=0 \
-python3 main.py \
+$python_exec main.py \
     --num_nodes $node_num \
     --num_gpus $num_gpu_per_node \
     --config $config \

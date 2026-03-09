@@ -40,6 +40,43 @@ case "$model_type" in
         ;;
 esac
 
+# Allow overriding config/output_dir via extra args.
+config_override=""
+output_override=""
+filtered_args=()
+idx=0
+while [[ $idx -lt ${#extra_args[@]} ]]; do
+    arg="${extra_args[$idx]}"
+    case "$arg" in
+        --config)
+            idx=$((idx + 1))
+            config_override="${extra_args[$idx]}"
+            ;;
+        --config=*)
+            config_override="${arg#*=}"
+            ;;
+        --output_dir)
+            idx=$((idx + 1))
+            output_override="${extra_args[$idx]}"
+            ;;
+        --output_dir=*)
+            output_override="${arg#*=}"
+            ;;
+        *)
+            filtered_args+=("$arg")
+            ;;
+    esac
+    idx=$((idx + 1))
+done
+
+if [[ -n "$config_override" ]]; then
+    config="$config_override"
+fi
+if [[ -n "$output_override" ]]; then
+    output_dir="$output_override"
+fi
+extra_args=("${filtered_args[@]}")
+
 bash scripts/train_deepspeed.sh \
     $node_num \
     $node_rank \

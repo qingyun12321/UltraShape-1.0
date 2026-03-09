@@ -568,6 +568,7 @@ class RefineDiT(nn.Module):
         num_experts: int = 8,
         moe_top_k: int = 2,
         voxel_query_res: int = 128,
+        use_activation_checkpointing: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -586,6 +587,7 @@ class RefineDiT(nn.Module):
         self.guidance_cond_proj_dim = guidance_cond_proj_dim
 
         self.text_len = text_len
+        self.use_activation_checkpointing = use_activation_checkpointing
 
         self.x_embedder = nn.Linear(in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size, hidden_size * 4, cond_proj_dim=guidance_cond_proj_dim)
@@ -627,7 +629,6 @@ class RefineDiT(nn.Module):
         cond_sin = torch.zeros(x.shape[0], num_cond_tokens, head_dim, device=device)
 
         voxel_cond = kwargs.get('voxel_cond')
-        # rotary_cos_vox, rotary_sin_vox = precompute_freqs_cis_3d(head_dim, voxel_cond)
         rotary_cos_vox, rotary_sin_vox = precompute_freqs_cis_3d_interpolated(
             head_dim, voxel_cond, current_res=self.voxel_query_res)
 
@@ -640,7 +641,39 @@ class RefineDiT(nn.Module):
         skip_value_list = []
         for layer, block in enumerate(self.blocks):
             skip_value = None if layer <= self.depth // 2 else skip_value_list.pop()
-            x = block(x, c, cond, rotary_cos=rotary_cos, rotary_sin=rotary_sin, skip_value=skip_value)
+            if self.use_activation_checkpointing:
+                skip_value_ref = skip_value
+
+                def _block_forward(_x, _c, _cond, _rotary_cos, _rotary_sin):
+                    return block(
+                        _x,
+                        _c,
+                        _cond,
+                        rotary_cos=_rotary_cos,
+                        rotary_sin=_rotary_sin,
+                        skip_value=skip_value_ref,
+                    )
+                try:
+                    x = torch.utils.checkpoint.checkpoint(
+                        _block_forward,
+                        x,
+                        c,
+                        cond,
+                        rotary_cos,
+                        rotary_sin,
+                        use_reentrant=True,
+                    )
+                except TypeError:
+                    x = torch.utils.checkpoint.checkpoint(
+                        _block_forward,
+                        x,
+                        c,
+                        cond,
+                        rotary_cos,
+                        rotary_sin,
+                    )
+            else:
+                x = block(x, c, cond, rotary_cos=rotary_cos, rotary_sin=rotary_sin, skip_value=skip_value)
             if layer < self.depth // 2:
                 skip_value_list.append(x)
 
