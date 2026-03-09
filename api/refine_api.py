@@ -13,15 +13,15 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Deque, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import textwrap
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from PIL import Image
 import uvicorn
@@ -36,10 +36,6 @@ HUNYUAN_ROOT = os.environ.get(
 )
 
 MODEL_PATH = os.environ.get("HY3D_MODEL_PATH", "tencent/Hunyuan3D-2.1")
-HUNYUAN_OUTPUT_DIR = os.environ.get(
-    "HY3D_SAVE_DIR", os.path.join(API_ROOT, "hunyuan_outputs")
-)
-
 ULTRASHAPE_CKPT = os.environ.get(
     "ULTRASHAPE_CKPT", os.path.join(ULTRASHAPE_ROOT, "checkpoints", "ultrashape_v1.pt")
 )
@@ -47,8 +43,6 @@ ULTRASHAPE_CONFIG = os.environ.get(
     "ULTRASHAPE_CONFIG",
     os.path.join(ULTRASHAPE_ROOT, "configs", "infer_dit_refine.yaml"),
 )
-ULTRASHAPE_OUTPUT_DIR = os.environ.get("ULTRASHAPE_OUTPUT_DIR", API_ROOT)
-INPUT_DIR = os.path.join(API_ROOT, "inputs")
 KEEP_INTERMEDIATE = os.environ.get("KEEP_INTERMEDIATE", "0") == "1"
 HUNYUAN_CACHE_DIR = os.environ.get(
     "HUNYUAN_CACHE_DIR", os.path.join(HUNYUAN_ROOT, "cache")
@@ -100,7 +94,6 @@ ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
     "ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST", ULTRASHAPE_CUDA_VISIBLE_DEVICES
 )
 SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
-MAX_GLB_FILES = int(os.environ.get("MAX_GLB_FILES", "0"))
 AUTO_START_LOCAL_SERVICES = os.environ.get("AUTO_START_LOCAL_SERVICES", "0") == "1"
 AUTO_START_HUNYUAN = os.environ.get("AUTO_START_HUNYUAN", "1") == "1"
 AUTO_START_ULTRASHAPE = os.environ.get("AUTO_START_ULTRASHAPE", "1") == "1"
@@ -113,18 +106,19 @@ HUNYUAN_SERVICE_PYTHON = os.environ.get(
 ULTRASHAPE_SERVICE_PYTHON = os.environ.get(
     "ULTRASHAPE_SERVICE_PYTHON", os.environ.get("PYTHON_BIN", sys.executable)
 )
+TASK_MANAGER_BASE = os.environ.get("TASK_MANAGER_BASE", "http://36.133.236.108:8090").rstrip("/")
+TASK_MANAGER_PROJECT = os.environ.get("TASK_MANAGER_PROJECT", "ultrashape")
+QUEUE_IDLE_PAUSE_DELAY_SEC = float(os.environ.get("QUEUE_IDLE_PAUSE_DELAY_SEC", "2"))
+OSS_BUCKET = os.environ.get("ULTRASHAPE_OSS_BUCKET", "kokokoni")
+OSS_PREFIX = os.environ.get("ULTRASHAPE_OSS_PREFIX", "docker-input&output/ultrashape").strip("/")
+OSS_SIGN_EXPIRES = os.environ.get("ULTRASHAPE_OSS_SIGN_EXPIRES", "24h")
+TMP_ROOT = os.environ.get("ULTRASHAPE_TMP_ROOT", "/tmp/ultrashape-oss-workspace")
 
 _CONDA_SH_CACHE = None
 TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
-TASK_QUEUE: "queue.Queue[Dict[str, object]]" = queue.Queue(maxsize=TASK_QUEUE_MAXSIZE)
-TASKS_LOCK = threading.Lock()
-TASKS: Dict[str, Dict[str, Optional[str]]] = {}
-WORKER_THREADS: List[threading.Thread] = []
 SLOT_QUEUE: "queue.Queue[Dict[str, str]]" = queue.Queue()
 SLOTS_LOCK = threading.Lock()
 SLOTS: List[Dict[str, str]] = []
-RESULTS_LOCK = threading.Lock()
-RESULTS_QUEUE: Deque[str] = deque()
 MANAGED_SERVICE_LOCK = threading.Lock()
 MANAGED_SERVICE_PROCS: List[subprocess.Popen] = []
 MANAGED_SERVICES_STARTED = False
@@ -169,6 +163,166 @@ class AsyncGenerateRequest(BaseModel):
     parameters: Optional[AsyncParameters] = None
 
 
+@dataclass
+class RequestRecord:
+    status: str
+    created_at: float = field(default_factory=time.time)
+    error: str = ""
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+
+
+class SingleWorkerTaskQueue:
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: list[tuple[str, Any]] = []
+        self._current_request_id: str | None = None
+        self._records: dict[str, RequestRecord] = {}
+        self._worker: threading.Thread | None = None
+        self._running = False
+        self._idle_callback: Any = None
+
+    def start(
+        self,
+        handler: Any,
+        *,
+        idle_callback: Any = None,
+    ) -> None:
+        with self._cond:
+            if self._worker and self._worker.is_alive():
+                return
+            self._idle_callback = idle_callback
+            self._running = True
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                args=(handler,),
+                daemon=True,
+                name="ultrashape-run-queue-worker",
+            )
+            self._worker.start()
+
+    def enqueue(
+        self,
+        payload: Any,
+        *,
+        request_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        rid = (request_id or "").strip() or str(uuid.uuid4())
+        initial_meta = dict(metadata or {})
+
+        with self._cond:
+            record = self._records.get(rid)
+            if record and record.status in {"pending", "processing"}:
+                raise ValueError("request_id already exists in queue")
+
+            self._records[rid] = RequestRecord(status="pending", result=initial_meta)
+            self._pending.append((rid, payload))
+            position = self._pending_position_unlocked(rid)
+            self._cond.notify()
+            return rid, position
+
+    def get_queue_status(self, request_id: str | None = None) -> dict[str, Any]:
+        with self._cond:
+            payload: dict[str, Any] = {
+                "processing": self._current_request_id is not None,
+                "pending": len(self._pending),
+                "current_request_id": self._current_request_id or "",
+            }
+            if request_id is not None:
+                rid = request_id.strip()
+                payload["status"] = self._records[rid].status if rid in self._records else "unknown"
+                payload["position"] = self._position_for_request_unlocked(rid)
+            else:
+                payload["status"] = (
+                    "processing" if self._current_request_id else ("pending" if self._pending else "idle")
+                )
+            return payload
+
+    def get_request_status(self, request_id: str) -> dict[str, Any] | None:
+        rid = request_id.strip()
+        with self._cond:
+            record = self._records.get(rid)
+            if not record:
+                return None
+            result = dict(record.result)
+            payload: dict[str, Any] = {
+                "request_id": rid,
+                "status": record.status,
+                "error": record.error,
+                "created_at": record.created_at,
+                "started_at": record.started_at,
+                "finished_at": record.finished_at,
+                "result": result,
+            }
+            for key, value in result.items():
+                if key not in payload:
+                    payload[key] = value
+            return payload
+
+    def is_idle(self) -> bool:
+        with self._cond:
+            return self._current_request_id is None and not self._pending
+
+    def _worker_loop(self, handler: Any) -> None:
+        while True:
+            with self._cond:
+                while self._running and not self._pending:
+                    self._cond.wait()
+                if not self._running:
+                    return
+                request_id, payload = self._pending.pop(0)
+                self._current_request_id = request_id
+                record = self._records[request_id]
+                record.status = "processing"
+                record.error = ""
+                record.started_at = time.time()
+                record.finished_at = None
+
+            try:
+                result = handler(request_id, payload) or {}
+                with self._cond:
+                    record = self._records[request_id]
+                    record.status = "completed"
+                    record.error = ""
+                    record.finished_at = time.time()
+                    if isinstance(result, dict):
+                        merged = dict(record.result)
+                        merged.update(result)
+                        record.result = merged
+            except Exception as exc:
+                with self._cond:
+                    record = self._records[request_id]
+                    record.status = "failed"
+                    record.error = str(exc)
+                    record.finished_at = time.time()
+            finally:
+                should_trigger_idle = False
+                with self._cond:
+                    if self._current_request_id == request_id:
+                        self._current_request_id = None
+                    should_trigger_idle = not self._pending and self._current_request_id is None
+                if should_trigger_idle and self._idle_callback:
+                    try:
+                        self._idle_callback()
+                    except Exception as exc:
+                        print(f"[queue] idle callback failed: {exc}")
+
+    def _position_for_request_unlocked(self, request_id: str) -> int:
+        if not request_id:
+            return -1
+        if request_id == self._current_request_id:
+            return 0
+        return self._pending_position_unlocked(request_id)
+
+    def _pending_position_unlocked(self, request_id: str) -> int:
+        for index, (rid, _) in enumerate(self._pending):
+            if rid == request_id:
+                return index + 1
+        return -1
+
+
 def _model_dump(model: Optional[BaseModel], **kwargs) -> Dict[str, object]:
     if model is None:
         return {}
@@ -179,6 +333,12 @@ def _model_dump(model: Optional[BaseModel], **kwargs) -> Dict[str, object]:
 
 def _build_refine_options(params: Optional[RefineParameters] = None) -> Dict[str, object]:
     return resolve_refine_options(_model_dump(params, exclude_none=True))
+
+
+EXECUTION_LOCK = threading.Lock()
+RUN_QUEUE = SingleWorkerTaskQueue()
+QUEUE_ACTIVITY_LOCK = threading.Lock()
+QUEUE_ACTIVITY_SEQ = 0
 
 
 def _build_cache_env(cache_root: str) -> Dict[str, str]:
@@ -461,35 +621,6 @@ def _release_slot(slot: Dict[str, str]) -> None:
     print(f"[scheduler] released slot {slot['slot_id']}")
 
 
-def _resolve_max_glb_files() -> int:
-    if MAX_GLB_FILES > 0:
-        return MAX_GLB_FILES
-    return max(1, len(SLOTS))
-
-
-def _record_result_path(result_path: str) -> None:
-    if not result_path:
-        return
-    with RESULTS_LOCK:
-        if result_path in RESULTS_QUEUE:
-            RESULTS_QUEUE.remove(result_path)
-        RESULTS_QUEUE.append(result_path)
-
-
-def _prune_results() -> None:
-    max_keep = _resolve_max_glb_files()
-    stale: List[str] = []
-    with RESULTS_LOCK:
-        while len(RESULTS_QUEUE) > max_keep:
-            stale.append(RESULTS_QUEUE.popleft())
-    for path in stale:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError as exc:
-                print(f"[cleanup] failed to remove {path}: {exc}")
-
-
 def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str, object]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -511,6 +642,179 @@ def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str
         raise RuntimeError(f"{url} unavailable: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{url} returned invalid JSON: {exc}") from exc
+
+
+def _tmp_root() -> str:
+    os.makedirs(TMP_ROOT, exist_ok=True)
+    return TMP_ROOT
+
+
+def _request_workspace(request_id: str) -> str:
+    workspace = os.path.join(_tmp_root(), "requests", request_id)
+    os.makedirs(workspace, exist_ok=True)
+    return workspace
+
+
+def _safe_filename(name: str) -> str:
+    file_name = os.path.basename((name or "").strip()) or "input-image"
+    file_name = file_name.replace("\x00", "")
+    return file_name
+
+
+def _normalize_upload_name(name: str, image_bytes: bytes) -> str:
+    file_name = _safe_filename(name)
+    stem, ext = os.path.splitext(file_name)
+    if ext:
+        return file_name
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+        fmt = (image.format or "").lower()
+    except Exception:
+        fmt = ""
+
+    guessed_ext = {
+        "jpeg": ".jpg",
+        "jpg": ".jpg",
+        "png": ".png",
+        "webp": ".webp",
+        "bmp": ".bmp",
+    }.get(fmt, ".png")
+    return f"{stem or 'input-image'}{guessed_ext}"
+
+
+def _write_binary(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _normalize_oss_key(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("oss://"):
+        payload = raw[len("oss://") :]
+        if "/" not in payload:
+            return ""
+        bucket, key = payload.split("/", 1)
+        if bucket and bucket != OSS_BUCKET:
+            raise RuntimeError(f"OSS bucket mismatch: {bucket}")
+        return key.lstrip("/")
+    return raw.lstrip("/")
+
+
+def _join_oss_key(*parts: str) -> str:
+    chunks = []
+    for part in parts:
+        p = str(part or "").strip("/")
+        if p:
+            chunks.append(p)
+    return "/".join(chunks)
+
+
+def _oss_url(oss_key: str) -> str:
+    key = _normalize_oss_key(oss_key)
+    if not key:
+        raise RuntimeError("Empty OSS key")
+    return f"oss://{OSS_BUCKET}/{key}"
+
+
+def _run_ossutil(args: list[str]) -> str:
+    timeout_sec = int(os.environ.get("ULTRASHAPE_OSSUTIL_TIMEOUT_SEC", "1800"))
+    cmd = ["ossutil", *args]
+    print(f"[oss] exec: {' '.join(cmd)} (timeout={timeout_sec}s)")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ossutil timeout after {timeout_sec}s") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("ossutil not found in PATH") from exc
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or "unknown ossutil error"
+        raise RuntimeError(f"ossutil {' '.join(args[:2])} failed: {detail}")
+    return (result.stdout or "").strip()
+
+
+def oss_upload_file(local_path: str, oss_key: str) -> None:
+    _run_ossutil(["cp", local_path, _oss_url(oss_key), "-f"])
+
+
+def oss_sign_url(oss_key: str, expires: str = OSS_SIGN_EXPIRES) -> str:
+    output = _run_ossutil(["presign", _oss_url(oss_key), "--expires-duration", expires])
+    for line in output.splitlines():
+        text = line.strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+    text = output.strip()
+    if text:
+        return text
+    raise RuntimeError("ossutil presign returned empty output")
+
+
+def _upload_artifact(local_path: str, oss_key: str) -> dict[str, str]:
+    oss_upload_file(local_path, oss_key)
+    return {
+        "oss_key": oss_key,
+        "url": oss_sign_url(oss_key),
+    }
+
+
+def _call_task_manager_pause() -> None:
+    if not TASK_MANAGER_BASE:
+        print("[task-manager] TASK_MANAGER_BASE empty, skip pause")
+        return
+    payload = {"project": TASK_MANAGER_PROJECT}
+    try:
+        _post_json(f"{TASK_MANAGER_BASE}/api/task/pause", payload, timeout=30)
+        print(f"[task-manager] paused project={TASK_MANAGER_PROJECT}")
+    except Exception as exc:
+        print(f"[task-manager] pause failed: {exc}")
+
+
+def _bump_queue_activity() -> int:
+    global QUEUE_ACTIVITY_SEQ
+    with QUEUE_ACTIVITY_LOCK:
+        QUEUE_ACTIVITY_SEQ += 1
+        return QUEUE_ACTIVITY_SEQ
+
+
+def _current_queue_activity() -> int:
+    with QUEUE_ACTIVITY_LOCK:
+        return QUEUE_ACTIVITY_SEQ
+
+
+def _schedule_pause_if_idle() -> None:
+    expected_seq = _current_queue_activity()
+
+    def _runner() -> None:
+        time.sleep(max(0.0, QUEUE_IDLE_PAUSE_DELAY_SEC))
+        if _current_queue_activity() != expected_seq:
+            return
+        if not RUN_QUEUE.is_idle():
+            return
+        _call_task_manager_pause()
+
+    threading.Thread(target=_runner, daemon=True, name=f"ultrashape-idle-pause-{expected_seq}").start()
+
+
+def _legacy_task_status(status: str) -> str:
+    return {
+        "pending": "PENDING",
+        "processing": "RUNNING",
+        "completed": "SUCCEEDED",
+        "failed": "FAILED",
+    }.get((status or "").strip().lower(), "PENDING")
+
+
+def _format_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _call_hunyuan_service(image_bytes: bytes, base_url: str) -> bytes:
@@ -647,9 +951,7 @@ def _hot_start() -> None:
 
 
 def _ensure_dirs() -> None:
-    os.makedirs(HUNYUAN_OUTPUT_DIR, exist_ok=True)
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    os.makedirs(ULTRASHAPE_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(_tmp_root(), exist_ok=True)
     _ensure_cache_dirs(HUNYUAN_CACHE_DIR)
     _ensure_cache_dirs(ULTRASHAPE_CACHE_DIR)
 
@@ -867,134 +1169,92 @@ def _load_image_from_base64(data: str) -> bytes:
         raise HTTPException(status_code=400, detail="Invalid base64 image") from exc
 
 
-def _generate_refined_glb(
-    image_bytes: bytes, params: Optional[RefineParameters] = None
-) -> str:
+def _run_refinement_job(
+    request_id: str,
+    image_bytes: bytes,
+    upload_name: str,
+    params: Optional[RefineParameters] = None,
+) -> dict[str, Any]:
     _ensure_dirs()
     _init_slots()
+    workspace_dir = _request_workspace(request_id)
+    file_name = _normalize_upload_name(upload_name, image_bytes)
+    input_image_path = os.path.join(workspace_dir, file_name)
+    coarse_mesh_path = os.path.join(workspace_dir, "coarse.glb")
+    refined_path = os.path.join(workspace_dir, "refined.glb")
+    oss_prefix_root = _join_oss_key(OSS_PREFIX, request_id)
     slot = _acquire_slot()
-    request_id = uuid.uuid4().hex
-    input_image_path = os.path.join(INPUT_DIR, f"{request_id}.png")
-    coarse_mesh_path = os.path.join(HUNYUAN_OUTPUT_DIR, f"{request_id}.glb")
-    refined_path = ""
 
-    print("[api] received request, saving input image")
-    _save_image_bytes(image_bytes, input_image_path)
+    _write_binary(input_image_path, image_bytes)
+    print(f"[api] request={request_id} workspace={workspace_dir}")
 
     try:
-        try:
+        with EXECUTION_LOCK:
             if USE_REMOTE_SERVICES:
-                coarse_mesh_bytes = _call_hunyuan_service(
-                    image_bytes, slot["hunyuan_url"]
-                )
-                with open(coarse_mesh_path, "wb") as coarse_file:
-                    coarse_file.write(coarse_mesh_bytes)
+                coarse_mesh_bytes = _call_hunyuan_service(image_bytes, slot["hunyuan_url"])
                 refined_mesh_bytes = _call_ultrashape_service(
-                    image_bytes, coarse_mesh_bytes, slot["ultrashape_url"], params
+                    image_bytes,
+                    coarse_mesh_bytes,
+                    slot["ultrashape_url"],
+                    params,
                 )
-                base_name = os.path.splitext(os.path.basename(input_image_path))[0]
-                refined_path = os.path.join(
-                    ULTRASHAPE_OUTPUT_DIR, f"{base_name}_refined.glb"
-                )
-                with open(refined_path, "wb") as refined_file:
-                    refined_file.write(refined_mesh_bytes)
+                _write_binary(refined_path, refined_mesh_bytes)
             else:
-                _run_hunyuan(
-                    input_image_path, coarse_mesh_path, slot["hunyuan_device"]
-                )
+                _run_hunyuan(input_image_path, coarse_mesh_path, slot["hunyuan_device"])
                 refined_path = _run_ultrashape(
                     input_image_path,
                     coarse_mesh_path,
-                    ULTRASHAPE_OUTPUT_DIR,
+                    workspace_dir,
                     slot["ultrashape_device"],
                     params,
                 )
-            backup_path = os.path.join(API_ROOT, "output.glb")
-            shutil.copyfile(refined_path, backup_path)
-            print(f"[api] backup saved: {backup_path}")
-            _record_result_path(refined_path)
-            _prune_results()
-        finally:
-            if not KEEP_INTERMEDIATE:
-                if os.path.exists(input_image_path):
-                    os.remove(input_image_path)
-                if os.path.exists(coarse_mesh_path):
-                    os.remove(coarse_mesh_path)
+
+        input_oss_key = _join_oss_key(oss_prefix_root, "input", file_name)
+        output_oss_key = _join_oss_key(oss_prefix_root, "output", "refined.glb")
+        input_artifact = _upload_artifact(input_image_path, input_oss_key)
+        glb_artifact = _upload_artifact(refined_path, output_oss_key)
+
+        return {
+            "oss_prefix": oss_prefix_root,
+            "artifacts": {
+                "input_image": input_artifact,
+                "glb": glb_artifact,
+            },
+        }
     finally:
         _release_slot(slot)
-
-    return refined_path
-
-
-def _now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not KEEP_INTERMEDIATE:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
-def _enqueue_task(image_bytes: bytes, params: Optional[RefineParameters] = None) -> str:
-    task_id = uuid.uuid4().hex
-    with TASKS_LOCK:
-        TASKS[task_id] = {
-            "task_id": task_id,
-            "task_status": "PENDING",
-            "submit_time": _now_str(),
-            "end_time": None,
-            "model_url": "",
-            "result_url": f"/api/v1/tasks/{task_id}/result",
-            "error_message": "",
-        }
-    TASK_QUEUE.put(
-        {
-            "task_id": task_id,
-            "image_bytes": image_bytes,
-            "params": _model_dump(params, exclude_none=True),
-        }
-    )
-    return task_id
+def _build_queue_payload(
+    image_bytes: bytes,
+    *,
+    upload_name: str,
+    params: Optional[RefineParameters],
+) -> dict[str, Any]:
+    return {
+        "image_bytes": image_bytes,
+        "upload_name": upload_name,
+        "params": _model_dump(params, exclude_none=True),
+    }
 
 
-def _worker_loop() -> None:
-    while True:
-        task = TASK_QUEUE.get()
-        task_id = task["task_id"]
-        image_bytes = task["image_bytes"]
-        params_data = task.get("params") or {}
-        params = RefineParameters(**params_data) if params_data else None
-        with TASKS_LOCK:
-            if task_id in TASKS:
-                TASKS[task_id]["task_status"] = "RUNNING"
-        try:
-            refined_path = _generate_refined_glb(image_bytes, params)
-        except Exception as exc:
-            with TASKS_LOCK:
-                if task_id in TASKS:
-                    TASKS[task_id]["task_status"] = "FAILED"
-                    TASKS[task_id]["end_time"] = _now_str()
-                    TASKS[task_id]["model_url"] = ""
-                    TASKS[task_id]["error_message"] = str(exc)
-        else:
-            with TASKS_LOCK:
-                if task_id in TASKS:
-                    TASKS[task_id]["task_status"] = "SUCCEEDED"
-                    TASKS[task_id]["end_time"] = _now_str()
-                    TASKS[task_id]["model_url"] = refined_path
-                    TASKS[task_id]["error_message"] = ""
-        finally:
-            TASK_QUEUE.task_done()
+def _execute_run_request(request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    image_bytes = payload["image_bytes"]
+    upload_name = str(payload.get("upload_name") or "input-image.png")
+    params_data = payload.get("params") or {}
+    params = RefineParameters(**params_data) if params_data else None
+    result = _run_refinement_job(request_id, image_bytes, upload_name, params)
+    return {
+        "request_id": request_id,
+        "artifacts": result["artifacts"],
+        "oss_prefix": result["oss_prefix"],
+    }
 
 
 def _start_worker() -> None:
-    global WORKER_THREADS
-    if any(thread.is_alive() for thread in WORKER_THREADS):
-        return
-    WORKER_THREADS = []
-    for idx in range(len(SLOTS)):
-        thread = threading.Thread(
-            target=_worker_loop,
-            daemon=True,
-            name=f"worker-{idx}",
-        )
-        thread.start()
-        WORKER_THREADS.append(thread)
+    RUN_QUEUE.start(_execute_run_request, idle_callback=_schedule_pause_if_idle)
 
 
 @app.on_event("startup")
@@ -1016,6 +1276,135 @@ def health_check():
     return {"status": "ok"}
 
 
+def _build_params_from_form(
+    precision: str = "standard",
+    steps: Optional[int] = None,
+    octree_res: Optional[int] = None,
+    num_latents: Optional[int] = None,
+    chunk_size: Optional[int] = None,
+    seed: Optional[int] = 42,
+    remove_bg: Optional[bool] = False,
+    scale: Optional[float] = 0.99,
+) -> RefineParameters:
+    return RefineParameters(
+        precision=precision,
+        steps=steps,
+        octree_res=octree_res,
+        num_latents=num_latents,
+        chunk_size=chunk_size,
+        seed=seed,
+        remove_bg=remove_bg,
+        scale=scale,
+    )
+
+
+def _ensure_image_upload(files: list[UploadFile]) -> UploadFile:
+    if not files:
+        raise HTTPException(status_code=400, detail="Exactly one image is required")
+    if len(files) != 1:
+        raise HTTPException(status_code=400, detail="Only one image is supported")
+
+    upload = files[0]
+    file_name = _safe_filename(upload.filename)
+    is_image = bool(upload.content_type and upload.content_type.startswith("image/"))
+    has_known_ext = os.path.splitext(file_name)[1].lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    if not is_image and not has_known_ext:
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
+    return upload
+
+
+async def _read_upload_bytes(upload: UploadFile) -> bytes:
+    try:
+        data = await upload.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read image: {exc}") from exc
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty")
+    return data
+
+
+def _enqueue_request(
+    image_bytes: bytes,
+    *,
+    upload_name: str,
+    params: Optional[RefineParameters],
+    request_id: str = "",
+) -> tuple[str, int]:
+    if TASK_QUEUE_MAXSIZE > 0:
+        queue_status = RUN_QUEUE.get_queue_status()
+        active_count = int(queue_status.get("pending", 0)) + (1 if queue_status.get("processing") else 0)
+        if active_count >= TASK_QUEUE_MAXSIZE:
+            raise HTTPException(status_code=429, detail="Queue is full, try again later")
+
+    _bump_queue_activity()
+    try:
+        return RUN_QUEUE.enqueue(
+            _build_queue_payload(image_bytes, upload_name=upload_name, params=params),
+            request_id=request_id or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/queue_status")
+def queue_status(request_id: str = ""):
+    rid = request_id.strip()
+    return RUN_QUEUE.get_queue_status(rid if rid else None)
+
+
+@app.get("/request_status")
+def request_status(request_id: str):
+    rid = request_id.strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    payload = RUN_QUEUE.get_request_status(rid)
+    if not payload:
+        raise HTTPException(status_code=404, detail="request_id not found")
+    return payload
+
+
+@app.post("/run_with_files")
+async def run_with_files(
+    image: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    request_id: str = Form(""),
+    precision: str = Form("standard"),
+    steps: Optional[int] = Form(None),
+    octree_res: Optional[int] = Form(None),
+    num_latents: Optional[int] = Form(None),
+    chunk_size: Optional[int] = Form(None),
+    seed: Optional[int] = Form(42),
+    remove_bg: Optional[bool] = Form(False),
+    scale: Optional[float] = Form(0.99),
+):
+    uploads = [item for item in ([image] if image else []) if item is not None]
+    if files:
+        uploads.extend(files)
+    upload = _ensure_image_upload(uploads)
+    image_bytes = await _read_upload_bytes(upload)
+    params = _build_params_from_form(
+        precision=precision,
+        steps=steps,
+        octree_res=octree_res,
+        num_latents=num_latents,
+        chunk_size=chunk_size,
+        seed=seed,
+        remove_bg=remove_bg,
+        scale=scale,
+    )
+    request_id_out, position = _enqueue_request(
+        image_bytes,
+        upload_name=_safe_filename(upload.filename),
+        params=params,
+        request_id=request_id,
+    )
+    return {
+        "status": "queued",
+        "request_id": request_id_out,
+        "position": position,
+    }
+
+
 @app.post("/generate")
 async def generate(
     image: UploadFile = File(...),
@@ -1028,15 +1417,9 @@ async def generate(
     remove_bg: Optional[bool] = Form(False),
     scale: Optional[float] = Form(0.99),
 ):
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image uploads are supported")
-
-    try:
-        image_bytes = await image.read()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read image: {exc}") from exc
-
-    params = RefineParameters(
+    upload = _ensure_image_upload([image])
+    image_bytes = await _read_upload_bytes(upload)
+    params = _build_params_from_form(
         precision=precision,
         steps=steps,
         octree_res=octree_res,
@@ -1046,44 +1429,34 @@ async def generate(
         remove_bg=remove_bg,
         scale=scale,
     )
-
-    try:
-        refined_path = _generate_refined_glb(image_bytes, params)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return FileResponse(
-        refined_path,
-        filename=os.path.basename(refined_path),
-        media_type="model/gltf-binary",
-    )
+    result = _run_refinement_job(uuid.uuid4().hex, image_bytes, _safe_filename(upload.filename), params)
+    glb = result["artifacts"]["glb"]
+    return RedirectResponse(glb["url"], status_code=307)
 
 
 @app.post("/generate_3d")
 async def generate_3d(req: GenerateRequest):
     image_bytes = _load_image_from_base64(req.image_base64)
     params = RefineParameters(**_model_dump(req, exclude={"image_base64"}))
-
-    try:
-        refined_path = _generate_refined_glb(image_bytes, params)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    with open(refined_path, "rb") as f:
-        model_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-    return {"status": "success", "model_data": model_base64, "format": "glb"}
+    result = _run_refinement_job(uuid.uuid4().hex, image_bytes, "input-image.png", params)
+    glb = result["artifacts"]["glb"]
+    return {
+        "status": "success",
+        "format": "glb",
+        "model_url": glb["url"],
+        "oss_key": glb["oss_key"],
+    }
 
 
 @app.post("/api/v1/services/aigc/3d-refine/generation")
 async def generate_async(req: AsyncGenerateRequest):
     image_bytes = _load_image_from_base64(req.input.image_base64)
     params = req.parameters or AsyncParameters()
-
-    if TASK_QUEUE.full():
-        raise HTTPException(status_code=429, detail="Queue is full, try again later")
-
-    task_id = _enqueue_task(image_bytes, params)
+    task_id, _position = _enqueue_request(
+        image_bytes,
+        upload_name="input-image.png",
+        params=params,
+    )
     return {
         "status_code": 200,
         "request_id": uuid.uuid4().hex,
@@ -1101,11 +1474,12 @@ async def generate_async(req: AsyncGenerateRequest):
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task(task_id: str):
-    with TASKS_LOCK:
-        task = TASKS.get(task_id)
-
-    if not task:
+    payload = RUN_QUEUE.get_request_status(task_id)
+    if not payload:
         raise HTTPException(status_code=404, detail="Task not found")
+    result = payload.get("result") or {}
+    artifacts = result.get("artifacts") or {}
+    glb = artifacts.get("glb") or {}
 
     return {
         "status_code": 200,
@@ -1114,12 +1488,13 @@ async def get_task(task_id: str):
         "message": "",
         "output": {
             "task_id": task_id,
-            "task_status": task["task_status"],
-            "model_url": task["model_url"],
-            "result_url": task["result_url"],
-            "submit_time": task["submit_time"],
-            "end_time": task["end_time"],
-            "error_message": task["error_message"],
+            "task_status": _legacy_task_status(str(payload.get("status") or "")),
+            "model_url": glb.get("url", ""),
+            "result_url": f"/api/v1/tasks/{task_id}/result",
+            "submit_time": _format_timestamp(payload.get("created_at")),
+            "end_time": _format_timestamp(payload.get("finished_at")),
+            "error_message": payload.get("error", ""),
+            "artifacts": artifacts,
         },
         "usage": None,
     }
@@ -1127,23 +1502,18 @@ async def get_task(task_id: str):
 
 @app.get("/api/v1/tasks/{task_id}/result")
 async def get_task_result(task_id: str):
-    with TASKS_LOCK:
-        task = TASKS.get(task_id)
-
-    if not task:
+    payload = RUN_QUEUE.get_request_status(task_id)
+    if not payload:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task["task_status"] != "SUCCEEDED":
+    if payload.get("status") != "completed":
         raise HTTPException(status_code=409, detail="Task not ready")
-
-    model_path = task["model_url"]
-    if not model_path or not os.path.exists(model_path):
+    result = payload.get("result") or {}
+    artifacts = result.get("artifacts") or {}
+    glb = artifacts.get("glb") or {}
+    glb_url = glb.get("url")
+    if not glb_url:
         raise HTTPException(status_code=404, detail="Model not found")
-
-    return FileResponse(
-        model_path,
-        filename=os.path.basename(model_path),
-        media_type="model/gltf-binary",
-    )
+    return RedirectResponse(glb_url, status_code=307)
 
 
 if __name__ == "__main__":
