@@ -42,6 +42,8 @@ LAZY_REMBG = os.environ.get("ULTRASHAPE_LAZY_REMBG", "1") == "1"
 STAGED_EXPORT = os.environ.get("ULTRASHAPE_STAGED_EXPORT", "1") == "1"
 IDLE_OFFLOAD_SECS = float(os.environ.get("ULTRASHAPE_IDLE_OFFLOAD_SECS", "60"))
 KEEP_ON_GPU_RAW = os.environ.get("ULTRASHAPE_KEEP_ON_GPU", "model,conditioner")
+ULTRASHAPE_DINO_MODEL = os.environ.get("ULTRASHAPE_DINO_MODEL", "facebook/dinov2-large")
+PREFETCH_DINO_ON_STARTUP = os.environ.get("ULTRASHAPE_PREFETCH_DINO_ON_STARTUP", "1") == "1"
 
 PIPELINE: Optional[UltraShapePipeline] = None
 PIPELINE_LOCK = threading.Lock()
@@ -218,6 +220,37 @@ def _ensure_models() -> None:
     _schedule_idle_offload()
 
 
+def _prefetch_dino_model() -> None:
+    if not ULTRASHAPE_DINO_MODEL or os.path.exists(ULTRASHAPE_DINO_MODEL):
+        return
+
+    cache_root = os.environ.get("ULTRASHAPE_CACHE_DIR", "").strip()
+    local_dir = os.environ.get("ULTRASHAPE_DINO_LOCAL_DIR", "").strip()
+    if not local_dir and cache_root:
+        local_dir = os.path.join(cache_root, "pretrained", ULTRASHAPE_DINO_MODEL.replace("/", "--"))
+
+    if local_dir and os.path.exists(os.path.join(local_dir, "config.json")):
+        print(f"[dino] using cached DINO config from {local_dir}")
+        return
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        print(f"[dino] huggingface_hub unavailable, skip prefetch: {exc}")
+        return
+
+    kwargs = {"repo_id": ULTRASHAPE_DINO_MODEL}
+    if local_dir:
+        kwargs["local_dir"] = local_dir
+        kwargs["local_dir_use_symlinks"] = False
+
+    try:
+        resolved = snapshot_download(**kwargs)
+        print(f"[dino] prefetched DINO assets to {resolved}")
+    except Exception as exc:
+        print(f"[dino] prefetch failed: {exc}")
+
+
 def _write_temp_glb(data: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp_file:
         tmp_file.write(data)
@@ -240,6 +273,8 @@ def _mesh_to_base64(mesh) -> str:
 
 @app.on_event("startup")
 def _startup() -> None:
+    if PREFETCH_DINO_ON_STARTUP:
+        threading.Thread(target=_prefetch_dino_model, daemon=True, name="ultrashape-dino-prefetch").start()
     if LOAD_ON_STARTUP:
         _ensure_models()
 

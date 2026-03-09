@@ -30,6 +30,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -41,6 +42,45 @@ from transformers import (
     Dinov2Config,
 )
 from transformers import AutoImageProcessor, AutoModel
+
+
+def _prepare_pretrained_source(
+    version: str | None,
+    *,
+    cache_env_var: str,
+    local_dir_env_var: str,
+) -> str | None:
+    if not version:
+        return version
+    if os.path.exists(version):
+        return version
+
+    explicit_local_dir = os.environ.get(local_dir_env_var, "").strip()
+    cache_root = os.environ.get(cache_env_var, "").strip()
+    fallback_local_dir = ""
+    if cache_root:
+        fallback_local_dir = os.path.join(cache_root, "pretrained", version.replace("/", "--"))
+
+    local_dir = explicit_local_dir or fallback_local_dir
+    if local_dir and os.path.exists(os.path.join(local_dir, "config.json")):
+        return local_dir
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return version
+
+    download_kwargs = {"repo_id": version}
+    if local_dir:
+        download_kwargs["local_dir"] = local_dir
+        download_kwargs["local_dir_use_symlinks"] = False
+
+    try:
+        return snapshot_download(**download_kwargs)
+    except Exception as exc:
+        if local_dir and os.path.exists(os.path.join(local_dir, "config.json")):
+            return local_dir
+        raise RuntimeError(f"Failed to prepare pretrained model '{version}': {exc}") from exc
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -74,7 +114,15 @@ class ImageEncoder(nn.Module):
         super().__init__()
 
         if config is None:
-            self.model = AutoModel.from_pretrained(version)
+            source = _prepare_pretrained_source(
+                version,
+                cache_env_var="ULTRASHAPE_CACHE_DIR",
+                local_dir_env_var="ULTRASHAPE_DINO_LOCAL_DIR",
+            )
+            self.model = AutoModel.from_pretrained(
+                source,
+                local_files_only=bool(source and os.path.exists(str(source))),
+            )
         else:
             self.model = self.MODEL_CLASS(self.MODEL_CONFIG_CLASS.from_dict(config))
             
