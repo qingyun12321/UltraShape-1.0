@@ -24,6 +24,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", ULTRASHAPE_VISIBLE_DEVICES)
 
 import torch
 
+from refine_presets import resolve_refine_options
 from ultrashape.rembg import BackgroundRemover
 from ultrashape.utils.misc import instantiate_from_config
 from ultrashape.surface_loaders import SharpEdgeSurfaceLoader
@@ -36,8 +37,6 @@ CKPT_PATH = os.environ.get(
 CONFIG_PATH = os.environ.get(
     "ULTRASHAPE_CONFIG", os.path.join(ULTRASHAPE_ROOT, "configs", "infer_dit_refine.yaml")
 )
-DEFAULT_STEPS = int(os.environ.get("ULTRASHAPE_STEPS", "12"))
-DEFAULT_OCTREE_RES = int(os.environ.get("ULTRASHAPE_OCTREE_RES", "512"))
 LOAD_ON_STARTUP = os.environ.get("ULTRASHAPE_LOAD_ON_STARTUP", "1") == "1"
 LAZY_REMBG = os.environ.get("ULTRASHAPE_LAZY_REMBG", "1") == "1"
 STAGED_EXPORT = os.environ.get("ULTRASHAPE_STAGED_EXPORT", "1") == "1"
@@ -60,8 +59,11 @@ app = FastAPI(title="UltraShape Refine Service")
 class RefineRequest(BaseModel):
     image_base64: str
     mesh_base64: str
+    precision: Optional[str] = "standard"
     steps: Optional[int] = None
     octree_res: Optional[int] = None
+    num_latents: Optional[int] = None
+    chunk_size: Optional[int] = None
     seed: Optional[int] = 42
     remove_bg: Optional[bool] = False
     scale: Optional[float] = 0.99
@@ -70,6 +72,12 @@ class RefineRequest(BaseModel):
 class RefineResponse(BaseModel):
     status: str
     mesh_base64: str
+
+
+def _model_dump(model: BaseModel) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 def _decode_base64(data: str) -> bytes:
@@ -259,29 +267,34 @@ def refine(req: RefineRequest):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid mesh base64: {exc}") from exc
 
-    remove_bg = bool(req.remove_bg) or image.mode != "RGBA"
+    mesh_path = _write_temp_glb(mesh_bytes)
+    options = resolve_refine_options(_model_dump(req), fallback_num_latents=TOKEN_NUM)
+    steps = int(options["steps"])
+    octree_res = int(options["octree_res"])
+    token_num = int(options["num_latents"])
+    chunk_size = int(options["chunk_size"])
+    seed = int(options["seed"])
+    scale = float(options["scale"])
+    remove_bg = bool(options["remove_bg"]) or image.mode != "RGBA"
+
     if remove_bg:
         global REMBG
         if REMBG is None:
             REMBG = BackgroundRemover()
         image = REMBG(image)
 
-    mesh_path = _write_temp_glb(mesh_bytes)
-    steps = int(req.steps or DEFAULT_STEPS)
-    octree_res = int(req.octree_res or DEFAULT_OCTREE_RES)
-
     _cancel_idle_offload()
     try:
         with PIPELINE_LOCK:
             PIPELINE.to(DEVICE)
-            surface = LOADER(mesh_path, normalize_scale=req.scale).to(
+            surface = LOADER(mesh_path, normalize_scale=scale).to(
                 DEVICE, dtype=torch.float16
             )
             pc = surface[:, :, :3]
-            _, voxel_idx = voxelize_from_point(pc, TOKEN_NUM, resolution=VOXEL_RES)
+            _, voxel_idx = voxelize_from_point(pc, token_num, resolution=VOXEL_RES)
             del surface, pc
 
-            generator = torch.Generator(DEVICE).manual_seed(int(req.seed or 42))
+            generator = torch.Generator(DEVICE).manual_seed(seed)
             with torch.no_grad():
                 if DEVICE.type == "cuda":
                     autocast_ctx = torch.autocast(
@@ -299,7 +312,7 @@ def refine(req: RefineRequest):
                             mc_level=0.0,
                             octree_resolution=octree_res,
                             num_inference_steps=steps,
-                            num_chunks=2048,
+                            num_chunks=chunk_size,
                             output_type="latent",
                         )
                         _offload_after_diffusion()
@@ -308,7 +321,7 @@ def refine(req: RefineRequest):
                             output_type="trimesh",
                             box_v=1.0,
                             mc_level=0.0,
-                            num_chunks=2048,
+                            num_chunks=chunk_size,
                             octree_resolution=octree_res,
                             mc_algo=None,
                             enable_pbar=True,
@@ -323,7 +336,7 @@ def refine(req: RefineRequest):
                             mc_level=0.0,
                             octree_resolution=octree_res,
                             num_inference_steps=steps,
-                            num_chunks=2048,
+                            num_chunks=chunk_size,
                         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

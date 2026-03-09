@@ -48,10 +48,19 @@ export CUDA_VISIBLE_DEVICES="$ULTRASHAPE_CUDA_VISIBLE_DEVICES"
 export PYTORCH_CUDA_ALLOC_CONF
 : "${ULTRASHAPE_OCTREE_RES:=512}"
 : "${ULTRASHAPE_STEPS:=50}"
+: "${ULTRASHAPE_CHUNK_SIZE:=2048}"
+: "${ULTRASHAPE_NUM_LATENTS:=}"
+: "${ULTRASHAPE_SCALE:=0.99}"
+: "${ULTRASHAPE_SEED:=42}"
+: "${ULTRASHAPE_REMOVE_BG:=0}"
 echo "[run] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[run] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 echo "[run] ULTRASHAPE_OCTREE_RES=${ULTRASHAPE_OCTREE_RES}"
 echo "[run] ULTRASHAPE_STEPS=${ULTRASHAPE_STEPS}"
+echo "[run] ULTRASHAPE_CHUNK_SIZE=${ULTRASHAPE_CHUNK_SIZE}"
+if [ -n "$ULTRASHAPE_NUM_LATENTS" ]; then
+  echo "[run] ULTRASHAPE_NUM_LATENTS=${ULTRASHAPE_NUM_LATENTS}"
+fi
 
 # Allow overriding inputs with args or env vars while keeping defaults.
 IMAGE_PATH="${1:-${ULTRASHAPE_IMAGE:-inputs/image/demo.png}}"
@@ -66,21 +75,27 @@ OUTPUT_DIR="${ULTRASHAPE_OUTPUT_DIR:-}"
 #     --output_dir data/sample
 
 # inference refine_dit
+set -- scripts/infer_dit_refine.py \
+    --ckpt "$CKPT_PATH" \
+    --image "$IMAGE_PATH" \
+    --mesh "$MESH_PATH" \
+    --config "$CONFIG_PATH" \
+    --octree_res "$ULTRASHAPE_OCTREE_RES" \
+    --steps "$ULTRASHAPE_STEPS" \
+    --chunk_size "$ULTRASHAPE_CHUNK_SIZE" \
+    --scale "$ULTRASHAPE_SCALE" \
+    --seed "$ULTRASHAPE_SEED"
+
 if [ -n "$OUTPUT_DIR" ]; then
-  PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/infer_dit_refine.py \
-      --ckpt "$CKPT_PATH" \
-      --image "$IMAGE_PATH" \
-      --mesh "$MESH_PATH" \
-      --config "$CONFIG_PATH" \
-      --output_dir "$OUTPUT_DIR" \
-      --octree_res "$ULTRASHAPE_OCTREE_RES" \
-      --steps "$ULTRASHAPE_STEPS"
-else
-  PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" scripts/infer_dit_refine.py \
-      --ckpt "$CKPT_PATH" \
-      --image "$IMAGE_PATH" \
-      --mesh "$MESH_PATH" \
-      --config "$CONFIG_PATH" \
-      --octree_res "$ULTRASHAPE_OCTREE_RES" \
-      --steps "$ULTRASHAPE_STEPS"
+  set -- "$@" --output_dir "$OUTPUT_DIR"
 fi
+
+if [ -n "$ULTRASHAPE_NUM_LATENTS" ]; then
+  set -- "$@" --num_latents "$ULTRASHAPE_NUM_LATENTS"
+fi
+
+if [ "$ULTRASHAPE_REMOVE_BG" = "1" ]; then
+  set -- "$@" --remove_bg
+fi
+
+PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" "$@"

@@ -16,12 +16,14 @@ from datetime import datetime
 from typing import Deque, Dict, List, Optional
 import textwrap
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
 import uvicorn
+
+from refine_presets import resolve_refine_options
 
 API_ROOT = os.path.dirname(os.path.abspath(__file__))
 ULTRASHAPE_ROOT = os.path.abspath(os.path.join(API_ROOT, ".."))
@@ -60,8 +62,6 @@ ULTRASHAPE_ENV = os.environ.get("ULTRASHAPE_ENV", "ultrashape")
 ULTRASHAPE_CUDA_VISIBLE_DEVICES = os.environ.get(
     "ULTRASHAPE_CUDA_VISIBLE_DEVICES", "0"
 )
-ULTRASHAPE_OCTREE_RES = os.environ.get("ULTRASHAPE_OCTREE_RES", "512")
-ULTRASHAPE_STEPS = os.environ.get("ULTRASHAPE_STEPS", "12")
 PYTORCH_CUDA_ALLOC_CONF = os.environ.get(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
 )
@@ -122,23 +122,45 @@ app.add_middleware(
 )
 
 
-class GenerateRequest(BaseModel):
-    image_base64: str
+class RefineParameters(BaseModel):
     precision: Optional[str] = "standard"
+    steps: Optional[int] = None
+    octree_res: Optional[int] = None
+    num_latents: Optional[int] = None
+    chunk_size: Optional[int] = None
+    seed: Optional[int] = 42
+    remove_bg: Optional[bool] = False
+    scale: Optional[float] = 0.99
+
+
+class GenerateRequest(RefineParameters):
+    image_base64: str
 
 
 class AsyncInput(BaseModel):
     image_base64: str
 
 
-class AsyncParameters(BaseModel):
-    precision: Optional[str] = "standard"
+class AsyncParameters(RefineParameters):
+    pass
 
 
 class AsyncGenerateRequest(BaseModel):
     model: Optional[str] = "ultrashape-refine"
     input: AsyncInput
     parameters: Optional[AsyncParameters] = None
+
+
+def _model_dump(model: Optional[BaseModel], **kwargs) -> Dict[str, object]:
+    if model is None:
+        return {}
+    if hasattr(model, "model_dump"):
+        return model.model_dump(**kwargs)
+    return model.dict(**kwargs)
+
+
+def _build_refine_options(params: Optional[RefineParameters] = None) -> Dict[str, object]:
+    return resolve_refine_options(_model_dump(params, exclude_none=True))
 
 
 def _build_cache_env(cache_root: str) -> Dict[str, str]:
@@ -299,14 +321,16 @@ def _call_hunyuan_service(image_bytes: bytes, base_url: str) -> bytes:
 
 
 def _call_ultrashape_service(
-    image_bytes: bytes, mesh_bytes: bytes, base_url: str
+    image_bytes: bytes,
+    mesh_bytes: bytes,
+    base_url: str,
+    params: Optional[RefineParameters] = None,
 ) -> bytes:
     payload = {
         "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
         "mesh_base64": base64.b64encode(mesh_bytes).decode("utf-8"),
-        "steps": int(ULTRASHAPE_STEPS),
-        "octree_res": int(ULTRASHAPE_OCTREE_RES),
     }
+    payload.update(_build_refine_options(params))
     response = _post_json(
         f"{base_url}/refine", payload, timeout=SERVICE_TIMEOUT
     )
@@ -532,22 +556,33 @@ def _run_hunyuan(image_path: str, output_path: str, cuda_devices: str) -> None:
 
 
 def _run_ultrashape(
-    image_path: str, mesh_path: str, output_dir: str, cuda_devices: str
+    image_path: str,
+    mesh_path: str,
+    output_dir: str,
+    cuda_devices: str,
+    params: Optional[RefineParameters] = None,
 ) -> str:
     if not os.path.isdir(ULTRASHAPE_ROOT):
         raise RuntimeError(f"UltraShape root not found: {ULTRASHAPE_ROOT}")
 
+    refine_options = _build_refine_options(params)
     env = os.environ.copy()
     env.update(
         {
             "ULTRASHAPE_DISABLE_FLASH_ATTN": "1",
             "PYTORCH_CUDA_ALLOC_CONF": PYTORCH_CUDA_ALLOC_CONF,
             "ULTRASHAPE_CUDA_VISIBLE_DEVICES": cuda_devices,
-            "ULTRASHAPE_OCTREE_RES": str(ULTRASHAPE_OCTREE_RES),
-            "ULTRASHAPE_STEPS": str(ULTRASHAPE_STEPS),
+            "ULTRASHAPE_OCTREE_RES": str(refine_options["octree_res"]),
+            "ULTRASHAPE_STEPS": str(refine_options["steps"]),
+            "ULTRASHAPE_CHUNK_SIZE": str(refine_options["chunk_size"]),
+            "ULTRASHAPE_SCALE": str(refine_options["scale"]),
+            "ULTRASHAPE_SEED": str(refine_options["seed"]),
+            "ULTRASHAPE_REMOVE_BG": "1" if refine_options["remove_bg"] else "0",
             "ULTRASHAPE_OUTPUT_DIR": output_dir,
         }
     )
+    if "num_latents" in refine_options:
+        env["ULTRASHAPE_NUM_LATENTS"] = str(refine_options["num_latents"])
     env.update(_build_cache_env(ULTRASHAPE_CACHE_DIR))
 
     print(
@@ -555,8 +590,11 @@ def _run_ultrashape(
         f"{env['ULTRASHAPE_CUDA_VISIBLE_DEVICES']}"
     )
     print(f"[ultrashape] PYTORCH_CUDA_ALLOC_CONF={PYTORCH_CUDA_ALLOC_CONF}")
-    print(f"[ultrashape] ULTRASHAPE_OCTREE_RES={ULTRASHAPE_OCTREE_RES}")
-    print(f"[ultrashape] ULTRASHAPE_STEPS={ULTRASHAPE_STEPS}")
+    print(f"[ultrashape] ULTRASHAPE_OCTREE_RES={env['ULTRASHAPE_OCTREE_RES']}")
+    print(f"[ultrashape] ULTRASHAPE_STEPS={env['ULTRASHAPE_STEPS']}")
+    print(f"[ultrashape] ULTRASHAPE_CHUNK_SIZE={env['ULTRASHAPE_CHUNK_SIZE']}")
+    if "ULTRASHAPE_NUM_LATENTS" in env:
+        print(f"[ultrashape] ULTRASHAPE_NUM_LATENTS={env['ULTRASHAPE_NUM_LATENTS']}")
 
     script_path = os.path.join(ULTRASHAPE_ROOT, "scripts", "run.sh")
     args = ["bash", script_path, image_path, mesh_path]
@@ -625,7 +663,9 @@ def _load_image_from_base64(data: str) -> bytes:
         raise HTTPException(status_code=400, detail="Invalid base64 image") from exc
 
 
-def _generate_refined_glb(image_bytes: bytes) -> str:
+def _generate_refined_glb(
+    image_bytes: bytes, params: Optional[RefineParameters] = None
+) -> str:
     _ensure_dirs()
     _init_slots()
     slot = _acquire_slot()
@@ -646,7 +686,7 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
                 with open(coarse_mesh_path, "wb") as coarse_file:
                     coarse_file.write(coarse_mesh_bytes)
                 refined_mesh_bytes = _call_ultrashape_service(
-                    image_bytes, coarse_mesh_bytes, slot["ultrashape_url"]
+                    image_bytes, coarse_mesh_bytes, slot["ultrashape_url"], params
                 )
                 base_name = os.path.splitext(os.path.basename(input_image_path))[0]
                 refined_path = os.path.join(
@@ -663,6 +703,7 @@ def _generate_refined_glb(image_bytes: bytes) -> str:
                     coarse_mesh_path,
                     ULTRASHAPE_OUTPUT_DIR,
                     slot["ultrashape_device"],
+                    params,
                 )
             backup_path = os.path.join(API_ROOT, "output.glb")
             shutil.copyfile(refined_path, backup_path)
@@ -685,7 +726,7 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _enqueue_task(image_bytes: bytes) -> str:
+def _enqueue_task(image_bytes: bytes, params: Optional[RefineParameters] = None) -> str:
     task_id = uuid.uuid4().hex
     with TASKS_LOCK:
         TASKS[task_id] = {
@@ -697,7 +738,13 @@ def _enqueue_task(image_bytes: bytes) -> str:
             "result_url": f"/api/v1/tasks/{task_id}/result",
             "error_message": "",
         }
-    TASK_QUEUE.put({"task_id": task_id, "image_bytes": image_bytes})
+    TASK_QUEUE.put(
+        {
+            "task_id": task_id,
+            "image_bytes": image_bytes,
+            "params": _model_dump(params, exclude_none=True),
+        }
+    )
     return task_id
 
 
@@ -706,11 +753,13 @@ def _worker_loop() -> None:
         task = TASK_QUEUE.get()
         task_id = task["task_id"]
         image_bytes = task["image_bytes"]
+        params_data = task.get("params") or {}
+        params = RefineParameters(**params_data) if params_data else None
         with TASKS_LOCK:
             if task_id in TASKS:
                 TASKS[task_id]["task_status"] = "RUNNING"
         try:
-            refined_path = _generate_refined_glb(image_bytes)
+            refined_path = _generate_refined_glb(image_bytes, params)
         except Exception as exc:
             with TASKS_LOCK:
                 if task_id in TASKS:
@@ -758,7 +807,17 @@ def health_check():
 
 
 @app.post("/generate")
-async def generate(image: UploadFile = File(...)):
+async def generate(
+    image: UploadFile = File(...),
+    precision: str = Form("standard"),
+    steps: Optional[int] = Form(None),
+    octree_res: Optional[int] = Form(None),
+    num_latents: Optional[int] = Form(None),
+    chunk_size: Optional[int] = Form(None),
+    seed: Optional[int] = Form(42),
+    remove_bg: Optional[bool] = Form(False),
+    scale: Optional[float] = Form(0.99),
+):
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are supported")
 
@@ -767,8 +826,19 @@ async def generate(image: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read image: {exc}") from exc
 
+    params = RefineParameters(
+        precision=precision,
+        steps=steps,
+        octree_res=octree_res,
+        num_latents=num_latents,
+        chunk_size=chunk_size,
+        seed=seed,
+        remove_bg=remove_bg,
+        scale=scale,
+    )
+
     try:
-        refined_path = _generate_refined_glb(image_bytes)
+        refined_path = _generate_refined_glb(image_bytes, params)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -782,9 +852,10 @@ async def generate(image: UploadFile = File(...)):
 @app.post("/generate_3d")
 async def generate_3d(req: GenerateRequest):
     image_bytes = _load_image_from_base64(req.image_base64)
+    params = RefineParameters(**_model_dump(req, exclude={"image_base64"}))
 
     try:
-        refined_path = _generate_refined_glb(image_bytes)
+        refined_path = _generate_refined_glb(image_bytes, params)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -797,11 +868,12 @@ async def generate_3d(req: GenerateRequest):
 @app.post("/api/v1/services/aigc/3d-refine/generation")
 async def generate_async(req: AsyncGenerateRequest):
     image_bytes = _load_image_from_base64(req.input.image_base64)
+    params = req.parameters or AsyncParameters()
 
     if TASK_QUEUE.full():
         raise HTTPException(status_code=429, detail="Queue is full, try again later")
 
-    task_id = _enqueue_task(image_bytes)
+    task_id = _enqueue_task(image_bytes, params)
     return {
         "status_code": 200,
         "request_id": uuid.uuid4().hex,
