@@ -170,9 +170,15 @@ gradio_cache/
 
 data/polycam-downloads/
 data/artec3d-downloads/
+data/*_surface.ply
+api/*.glb
+api/inputs/
+api/hunyuan_outputs/
 data/dataset/meshes
 data/dataset/render
 data/dataset/sample
 outputs/
 cache/
 checkpoints/ultrashape_v1.pt
+checkpoints/*.pt
+checkpoints/*.ckpt
