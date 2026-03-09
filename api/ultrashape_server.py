@@ -37,7 +37,7 @@ CKPT_PATH = os.environ.get(
 CONFIG_PATH = os.environ.get(
     "ULTRASHAPE_CONFIG", os.path.join(ULTRASHAPE_ROOT, "configs", "infer_dit_refine.yaml")
 )
-LOAD_ON_STARTUP = os.environ.get("ULTRASHAPE_LOAD_ON_STARTUP", "1") == "1"
+LOAD_ON_STARTUP = os.environ.get("ULTRASHAPE_LOAD_ON_STARTUP", "0") == "1"
 LAZY_REMBG = os.environ.get("ULTRASHAPE_LAZY_REMBG", "1") == "1"
 STAGED_EXPORT = os.environ.get("ULTRASHAPE_STAGED_EXPORT", "1") == "1"
 IDLE_OFFLOAD_SECS = float(os.environ.get("ULTRASHAPE_IDLE_OFFLOAD_SECS", "60"))

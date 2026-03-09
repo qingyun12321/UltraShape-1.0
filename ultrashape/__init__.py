@@ -43,6 +43,40 @@ def _setup_cache_env() -> None:
 
 _setup_cache_env()
 
-from .pipelines import UltraShapePipeline
-from .postprocessors import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
-from .preprocessors import ImageProcessorV2, IMAGE_PROCESSORS, DEFAULT_IMAGEPROCESSOR
+__all__ = [
+    "UltraShapePipeline",
+    "FaceReducer",
+    "FloaterRemover",
+    "DegenerateFaceRemover",
+    "MeshSimplifier",
+    "ImageProcessorV2",
+    "IMAGE_PROCESSORS",
+    "DEFAULT_IMAGEPROCESSOR",
+]
+
+
+def __getattr__(name):
+    if name == "UltraShapePipeline":
+        from .pipelines import UltraShapePipeline
+        return UltraShapePipeline
+    if name in {"FaceReducer", "FloaterRemover", "DegenerateFaceRemover", "MeshSimplifier"}:
+        from .postprocessors import (
+            DegenerateFaceRemover,
+            FaceReducer,
+            FloaterRemover,
+            MeshSimplifier,
+        )
+        return {
+            "FaceReducer": FaceReducer,
+            "FloaterRemover": FloaterRemover,
+            "DegenerateFaceRemover": DegenerateFaceRemover,
+            "MeshSimplifier": MeshSimplifier,
+        }[name]
+    if name in {"ImageProcessorV2", "IMAGE_PROCESSORS", "DEFAULT_IMAGEPROCESSOR"}:
+        from .preprocessors import DEFAULT_IMAGEPROCESSOR, IMAGE_PROCESSORS, ImageProcessorV2
+        return {
+            "ImageProcessorV2": ImageProcessorV2,
+            "IMAGE_PROCESSORS": IMAGE_PROCESSORS,
+            "DEFAULT_IMAGEPROCESSOR": DEFAULT_IMAGEPROCESSOR,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

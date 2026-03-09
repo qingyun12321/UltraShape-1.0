@@ -18,4 +18,27 @@ from .attention_processors import FlashVDMCrossAttentionProcessor, CrossAttentio
 from .model import ShapeVAE, VectsetVAE
 from .surface_extractors import SurfaceExtractors, MCSurfaceExtractor, DMCSurfaceExtractor, Latent2MeshOutput
 from .volume_decoders import HierarchicalVolumeDecoding, FlashVDMVolumeDecoding, VanillaVolumeDecoder
-from .vae_trainer import VAETrainer
+
+__all__ = [
+    "CrossAttentionDecoder",
+    "FlashVDMCrossAttentionProcessor",
+    "CrossAttentionProcessor",
+    "FlashVDMTopMCrossAttentionProcessor",
+    "ShapeVAE",
+    "VectsetVAE",
+    "SurfaceExtractors",
+    "MCSurfaceExtractor",
+    "DMCSurfaceExtractor",
+    "Latent2MeshOutput",
+    "HierarchicalVolumeDecoding",
+    "FlashVDMVolumeDecoding",
+    "VanillaVolumeDecoder",
+    "VAETrainer",
+]
+
+
+def __getattr__(name):
+    if name == "VAETrainer":
+        from .vae_trainer import VAETrainer
+        return VAETrainer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
