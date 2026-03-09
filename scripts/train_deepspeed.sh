@@ -60,7 +60,9 @@ echo "[train_deepspeed] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
 
 # Prefer venv python when available.
 python_exec="python3"
-if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+if [[ -n "${UV_PROJECT_ENVIRONMENT:-}" && -x "${UV_PROJECT_ENVIRONMENT}/bin/python" ]]; then
+    python_exec="${UV_PROJECT_ENVIRONMENT}/bin/python"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
     python_exec="${VIRTUAL_ENV}/bin/python"
 else
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

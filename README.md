@@ -44,22 +44,16 @@ Extensive evaluations demonstrate that UltraShape 1.0 performs competitively wit
 ```bash
 git clone https://github.com/PKU-YuanGroup/UltraShape-1.0.git
 cd UltraShape-1.0
-# 1. Create and activate the environment
-conda create -n ultrashape python=3.10
-conda activate ultrashape
+# Use uv to create a CUDA 12.4 environment that can run both UltraShape-1.0
+# and Hunyuan3D-2.1.
+uv sync
+```
 
-# 2. Install PyTorch (CUDA 12.1 recommended)
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+For Docker, point uv at the container venv path before syncing:
 
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Install cubvh (Required for MC acceleration)
-pip install git+https://github.com/ashawkey/cubvh --no-build-isolation
-
-# For Training & Sampling (Optional)
-pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
-pip install https://data.pyg.org/whl/torch-2.5.0%2Bcu121/torch_cluster-1.6.3%2Bpt25cu121-cp310-cp310-linux_x86_64.whl
+```bash
+export UV_PROJECT_ENVIRONMENT=/opt/venv
+uv sync --locked --no-editable
 ```
 ⬇️ Model Weights
 

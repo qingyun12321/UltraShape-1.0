@@ -7,11 +7,19 @@ This folder contains two data-prep scripts:
 
 ## Environment (uv)
 
-We manage the virtual environment with uv at `UltraShape-1.0/.venv`.
+We manage the virtual environment with uv from the `UltraShape-1.0` project root.
 
 ```bash
 cd UltraShape-1.0
 uv sync
+```
+
+For Docker builds, set the target venv path explicitly:
+
+```bash
+cd UltraShape-1.0
+export UV_PROJECT_ENVIRONMENT=/opt/venv
+uv sync --locked --no-editable
 ```
 
 Run scripts with uv:

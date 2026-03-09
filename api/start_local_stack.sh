@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ULTRASHAPE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${ULTRASHAPE_ROOT}/.." && pwd)"
+HUNYUAN_ROOT_DEFAULT="${WORKSPACE_ROOT}/Hunyuan3D-2.1"
+
+export USE_REMOTE_SERVICES="${USE_REMOTE_SERVICES:-1}"
+export AUTO_START_LOCAL_SERVICES="${AUTO_START_LOCAL_SERVICES:-1}"
+export AUTO_START_HUNYUAN="${AUTO_START_HUNYUAN:-1}"
+export AUTO_START_ULTRASHAPE="${AUTO_START_ULTRASHAPE:-1}"
+
+export HUNYUAN_SERVICE_URLS="${HUNYUAN_SERVICE_URLS:-http://127.0.0.1:9084}"
+export ULTRASHAPE_SERVICE_URLS="${ULTRASHAPE_SERVICE_URLS:-http://127.0.0.1:9085}"
+
+export HUNYUAN_CUDA_VISIBLE_DEVICES_LIST="${HUNYUAN_CUDA_VISIBLE_DEVICES_LIST:-0}"
+export ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST="${ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST:-0}"
+export HUNYUAN_ROOT="${HUNYUAN_ROOT:-${HUNYUAN_ROOT_DEFAULT}}"
+export HUNYUAN_CACHE_DIR="${HUNYUAN_CACHE_DIR:-${HUNYUAN_ROOT}/cache}"
+export ULTRASHAPE_CACHE_DIR="${ULTRASHAPE_CACHE_DIR:-${ULTRASHAPE_ROOT}/cache}"
+
+python_exec="${REFINE_API_PYTHON:-}"
+if [[ -z "${python_exec}" ]]; then
+    if [[ -n "${UV_PROJECT_ENVIRONMENT:-}" && -x "${UV_PROJECT_ENVIRONMENT}/bin/python" ]]; then
+        python_exec="${UV_PROJECT_ENVIRONMENT}/bin/python"
+    elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+        python_exec="${VIRTUAL_ENV}/bin/python"
+    else
+        python_exec="python3"
+    fi
+fi
+
+export REFINE_API_PYTHON="${python_exec}"
+export HUNYUAN_SERVICE_PYTHON="${HUNYUAN_SERVICE_PYTHON:-${python_exec}}"
+export ULTRASHAPE_SERVICE_PYTHON="${ULTRASHAPE_SERVICE_PYTHON:-${python_exec}}"
+
+exec "${python_exec}" \
+    "${SCRIPT_DIR}/refine_api.py" \
+    --host "${REFINE_API_HOST:-0.0.0.0}" \
+    --port "${REFINE_API_PORT:-10083}"

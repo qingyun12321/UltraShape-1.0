@@ -7,7 +7,9 @@ import queue
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -15,6 +17,7 @@ from collections import deque
 from datetime import datetime
 from typing import Deque, Dict, List, Optional
 import textwrap
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,6 +101,18 @@ ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
 )
 SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
 MAX_GLB_FILES = int(os.environ.get("MAX_GLB_FILES", "0"))
+AUTO_START_LOCAL_SERVICES = os.environ.get("AUTO_START_LOCAL_SERVICES", "0") == "1"
+AUTO_START_HUNYUAN = os.environ.get("AUTO_START_HUNYUAN", "1") == "1"
+AUTO_START_ULTRASHAPE = os.environ.get("AUTO_START_ULTRASHAPE", "1") == "1"
+LOCAL_SERVICE_START_TIMEOUT = float(
+    os.environ.get("LOCAL_SERVICE_START_TIMEOUT", "180")
+)
+HUNYUAN_SERVICE_PYTHON = os.environ.get(
+    "HUNYUAN_SERVICE_PYTHON", os.environ.get("PYTHON_BIN", sys.executable)
+)
+ULTRASHAPE_SERVICE_PYTHON = os.environ.get(
+    "ULTRASHAPE_SERVICE_PYTHON", os.environ.get("PYTHON_BIN", sys.executable)
+)
 
 _CONDA_SH_CACHE = None
 TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
@@ -110,6 +125,9 @@ SLOTS_LOCK = threading.Lock()
 SLOTS: List[Dict[str, str]] = []
 RESULTS_LOCK = threading.Lock()
 RESULTS_QUEUE: Deque[str] = deque()
+MANAGED_SERVICE_LOCK = threading.Lock()
+MANAGED_SERVICE_PROCS: List[subprocess.Popen] = []
+MANAGED_SERVICES_STARTED = False
 
 app = FastAPI(title="UltraShape Refine API")
 
@@ -188,6 +206,192 @@ def _ensure_cache_dirs(cache_root: str) -> None:
 
 def _split_slots(value: str) -> List[str]:
     return [item.strip() for item in value.split(";") if item.strip()]
+
+
+def _parse_service_endpoint(base_url: str) -> Dict[str, object]:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(f"Unsupported service URL scheme: {base_url}")
+    if not parsed.hostname:
+        raise RuntimeError(f"Service URL missing hostname: {base_url}")
+    if parsed.port is None:
+        raise RuntimeError(f"Service URL missing port: {base_url}")
+
+    return {
+        "base_url": base_url.rstrip("/"),
+        "host": parsed.hostname,
+        "bind_host": "0.0.0.0" if parsed.hostname in {"127.0.0.1", "localhost"} else parsed.hostname,
+        "port": parsed.port,
+    }
+
+
+def _wait_for_health(base_url: str, timeout: float, service_name: str) -> None:
+    deadline = time.time() + timeout
+    health_url = f"{base_url.rstrip('/')}/health"
+    last_error = ""
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as response:
+                if response.status < 400:
+                    return
+                last_error = f"HTTP {response.status}"
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(1)
+
+    raise RuntimeError(
+        f"{service_name} did not become healthy within {timeout:.0f}s: {last_error}"
+    )
+
+
+def _spawn_service_process(
+    service_name: str,
+    python_bin: str,
+    script_path: str,
+    cwd: str,
+    env: Dict[str, str],
+) -> subprocess.Popen:
+    print(f"[stack] starting {service_name}: {python_bin} {script_path}")
+    return subprocess.Popen(
+        [python_bin, script_path],
+        cwd=cwd,
+        env=env,
+    )
+
+
+def _stop_managed_services() -> None:
+    global MANAGED_SERVICES_STARTED
+    with MANAGED_SERVICE_LOCK:
+        procs = list(MANAGED_SERVICE_PROCS)
+        MANAGED_SERVICE_PROCS.clear()
+        MANAGED_SERVICES_STARTED = False
+
+    if not procs:
+        return
+
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+
+    deadline = time.time() + 10
+    for proc in procs:
+        if proc.poll() is not None:
+            continue
+        remaining = max(0, deadline - time.time())
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _start_managed_services() -> None:
+    global MANAGED_SERVICES_STARTED
+    if not USE_REMOTE_SERVICES or not AUTO_START_LOCAL_SERVICES:
+        return
+
+    with MANAGED_SERVICE_LOCK:
+        if MANAGED_SERVICES_STARTED:
+            return
+
+        started: List[subprocess.Popen] = []
+        try:
+            if AUTO_START_HUNYUAN:
+                hunyuan_urls = _split_slots(HUNYUAN_SERVICE_URLS)
+                hunyuan_devices = _split_slots(HUNYUAN_CUDA_VISIBLE_DEVICES_LIST)
+                if len(hunyuan_urls) != len(hunyuan_devices):
+                    raise RuntimeError(
+                        "HUNYUAN_SERVICE_URLS and HUNYUAN_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+                    )
+
+                for idx, (base_url, device) in enumerate(
+                    zip(hunyuan_urls, hunyuan_devices)
+                ):
+                    endpoint = _parse_service_endpoint(base_url)
+                    env = os.environ.copy()
+                    env.update(_build_cache_env(HUNYUAN_CACHE_DIR))
+                    env.update(
+                        {
+                            "HUNYUAN_ROOT": HUNYUAN_ROOT,
+                            "HUNYUAN_CACHE_DIR": HUNYUAN_CACHE_DIR,
+                            "HUNYUAN_CUDA_VISIBLE_DEVICES": device,
+                            "HUNYUAN_SERVICE_HOST": str(endpoint["bind_host"]),
+                            "HUNYUAN_SERVICE_PORT": str(endpoint["port"]),
+                        }
+                    )
+                    started.append(
+                        _spawn_service_process(
+                            f"hunyuan-{idx}",
+                            HUNYUAN_SERVICE_PYTHON,
+                            os.path.join(HUNYUAN_ROOT, "api", "hunyuan_server.py"),
+                            HUNYUAN_ROOT,
+                            env,
+                        )
+                    )
+
+            if AUTO_START_ULTRASHAPE:
+                ultrashape_urls = _split_slots(ULTRASHAPE_SERVICE_URLS)
+                ultrashape_devices = _split_slots(ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST)
+                if len(ultrashape_urls) != len(ultrashape_devices):
+                    raise RuntimeError(
+                        "ULTRASHAPE_SERVICE_URLS and ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+                    )
+
+                for idx, (base_url, device) in enumerate(
+                    zip(ultrashape_urls, ultrashape_devices)
+                ):
+                    endpoint = _parse_service_endpoint(base_url)
+                    env = os.environ.copy()
+                    env.update(_build_cache_env(ULTRASHAPE_CACHE_DIR))
+                    env.update(
+                        {
+                            "ULTRASHAPE_CACHE_DIR": ULTRASHAPE_CACHE_DIR,
+                            "ULTRASHAPE_CUDA_VISIBLE_DEVICES": device,
+                            "ULTRASHAPE_SERVICE_HOST": str(endpoint["bind_host"]),
+                            "ULTRASHAPE_SERVICE_PORT": str(endpoint["port"]),
+                        }
+                    )
+                    started.append(
+                        _spawn_service_process(
+                            f"ultrashape-{idx}",
+                            ULTRASHAPE_SERVICE_PYTHON,
+                            os.path.join(ULTRASHAPE_ROOT, "api", "ultrashape_server.py"),
+                            ULTRASHAPE_ROOT,
+                            env,
+                        )
+                    )
+
+            MANAGED_SERVICE_PROCS.extend(started)
+
+            if AUTO_START_HUNYUAN:
+                for idx, base_url in enumerate(_split_slots(HUNYUAN_SERVICE_URLS)):
+                    _wait_for_health(
+                        base_url,
+                        LOCAL_SERVICE_START_TIMEOUT,
+                        f"hunyuan-{idx}",
+                    )
+            if AUTO_START_ULTRASHAPE:
+                for idx, base_url in enumerate(_split_slots(ULTRASHAPE_SERVICE_URLS)):
+                    _wait_for_health(
+                        base_url,
+                        LOCAL_SERVICE_START_TIMEOUT,
+                        f"ultrashape-{idx}",
+                    )
+
+            MANAGED_SERVICES_STARTED = True
+            print("[stack] managed localhost services are healthy")
+        except Exception:
+            for proc in started:
+                if proc.poll() is None:
+                    proc.terminate()
+            for proc in started:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            MANAGED_SERVICE_PROCS.clear()
+            MANAGED_SERVICES_STARTED = False
+            raise
 
 
 def _build_slots() -> List[Dict[str, str]]:
@@ -797,8 +1001,14 @@ def _start_worker() -> None:
 def _startup() -> None:
     _ensure_dirs()
     _hot_start()
+    _start_managed_services()
     _init_slots()
     _start_worker()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _stop_managed_services()
 
 
 @app.get("/health")
