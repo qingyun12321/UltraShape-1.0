@@ -1,10 +1,10 @@
-# kokoni-ultrashape API
+# kokoni-shape API
 
 ## 1. 接入概览
 
-`kokoni-ultrashape` 采用百炼风格的异步任务模式：
+`kokoni-shape` 采用异步任务模式：
 
-1. 提交 UltraShape 细化任务
+1. 提交 kokoni-shape 细化任务
 2. 获取 `task_id`
 3. 轮询任务状态
 4. 任务完成后读取结果文件 URL
@@ -29,7 +29,7 @@ http://36.133.236.108:8091
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/services/aigc/3d-generation/reconstruction` | 创建 UltraShape 细化任务 |
+| `POST` | `/api/v1/services/aigc/3d-generation/reconstruction` | 创建 kokoni-shape 细化任务 |
 | `GET` | `/api/v1/tasks/{task_id}` | 查询任务状态与结果 |
 
 ## 5. 创建细化任务
@@ -57,7 +57,7 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 
 ```json
 {
-  "model": "kokoni-ultrashape",
+  "model": "kokoni-shape",
   "input": {
     "request_id": "optional-client-id"
   },
@@ -78,7 +78,7 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `model` | string | 是 | 模型名称，当前使用 `kokoni-ultrashape` |
+| `model` | string | 是 | 模型名称，当前使用 `kokoni-shape` |
 | `input` | object | 是 | 输入参数 |
 | `parameters` | object | 否 | 细化参数，不传时使用默认值 |
 
@@ -112,7 +112,7 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction' \
   -H 'Authorization: Bearer <YOUR_API_KEY>' \
   -F 'request={
-    "model":"kokoni-ultrashape",
+    "model":"kokoni-shape",
     "input":{
       "request_id":"req-001"
     },
@@ -162,7 +162,7 @@ GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 |---|---|
 | `PENDING` | 任务已创建，等待平台调度 |
 | `SCALING` | 平台正在恢复算力或等待可用节点 |
-| `RUNNING` | 任务正在执行 UltraShape 细化 |
+| `RUNNING` | 任务正在执行 kokoni-shape 细化 |
 | `SUCCEEDED` | 任务完成，可读取结果 |
 | `FAILED` | 任务失败，请查看 `message` |
 
@@ -227,14 +227,14 @@ curl --location 'http://36.133.236.108:8091/api/v1/tasks/44c6f1f6f2ff42889d29aaf
     "session_id": "req-001",
     "glb_url": "https://example.com/refined.glb",
     "model_url": "https://example.com/refined.glb",
-    "oss_prefix": "docker-input&output/ultrashape/req-001",
+    "oss_prefix": "docker-input&output/kokoni-shape/req-001",
     "artifacts": {
       "input_image": {
-        "oss_key": "docker-input&output/ultrashape/req-001/input/input.png",
+        "oss_key": "docker-input&output/kokoni-shape/req-001/input/input.png",
         "url": "https://example.com/input.png?..."
       },
       "glb": {
-        "oss_key": "docker-input&output/ultrashape/req-001/output/refined.glb",
+        "oss_key": "docker-input&output/kokoni-shape/req-001/output/refined.glb",
         "url": "https://example.com/refined.glb?..."
       }
     }
@@ -278,5 +278,3 @@ curl --location 'http://36.133.236.108:8091/api/v1/tasks/44c6f1f6f2ff42889d29aaf
 | `POST` | `/generate` | 直出 GLB 下载跳转 |
 | `POST` | `/generate_3d` | base64 入参的同步接口 |
 | `POST` | `/api/v1/services/aigc/3d-refine/generation` | runtime 自身的异步接口 |
-
-新前端页面 `ultrashape/3d-preview/3d_preview.html` 默认已切换为公共百炼风格 API，不再依赖 `recover -> runtime` 的旧链路。
