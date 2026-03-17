@@ -1,232 +1,240 @@
-# UltraShape API 文档
+# kokoni-ultrashape API
 
-适用默认项目：`ultrashape`
+## 1. 接入概览
 
-## 1. 服务地址
+`kokoni-ultrashape` 采用百炼风格的异步任务模式：
 
-### 1.1 Task-Manager
+1. 提交 UltraShape 细化任务
+2. 获取 `task_id`
+3. 轮询任务状态
+4. 任务完成后读取结果文件 URL
 
-- 默认地址：`http://36.133.236.108:8090`
-- 恢复任务：`POST /api/task/recover`
+## 2. 服务地址
 
-请求体：
+当前公共服务地址（下文中的 `base_url`）：
+
+```text
+http://36.133.236.108:8090
+```
+
+## 3. 鉴权
+
+公共 API 使用 **Bearer Token** 机制进行访问控制。客户端需要在 Header 中传递 `Authorization` 字段。
+
+| Header Field | Value Format | 说明 |
+|---|---|---|
+| `Authorization` | `Bearer <YOUR_API_KEY>` | 请将 `<YOUR_API_KEY>` 替换为实际分配的密钥 |
+
+## 4. 接口清单
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/services/aigc/3d-generation/reconstruction` | 创建 UltraShape 细化任务 |
+| `GET` | `/api/v1/tasks/{task_id}` | 查询任务状态与结果 |
+
+## 5. 创建细化任务
+
+### 5.1 请求地址
+
+```text
+POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction
+```
+
+### 5.2 请求类型
+
+`multipart/form-data`
+
+### 5.3 请求参数
+
+表单中包含两个部分：
+
+| 参数名 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `request` | string | 是 | JSON 字符串，外层结构固定为 `model / input / parameters` |
+| `files` | file[] | 是 | 输入图片文件；当前仅支持单张图片 |
+
+### 5.4 `request` 字段说明
 
 ```json
 {
-  "project": "ultrashape"
+  "model": "kokoni-ultrashape",
+  "input": {
+    "request_id": "optional-client-id"
+  },
+  "parameters": {
+    "precision": "standard",
+    "steps": 50,
+    "octree_res": 512,
+    "num_latents": 4096,
+    "chunk_size": 20000,
+    "seed": 42,
+    "remove_bg": false,
+    "scale": 0.99
+  }
 }
 ```
 
-关键响应字段：
+#### 顶层字段
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `service_url` | string | 是 | Runtime API 基地址 |
-| `recovered` | boolean | 否 | 本次请求是否触发任务恢复 |
+| `model` | string | 是 | 模型名称，当前使用 `kokoni-ultrashape` |
+| `input` | object | 是 | 输入参数 |
+| `parameters` | object | 否 | 细化参数，不传时使用默认值 |
 
-失败语义：
+#### `input` 字段
 
-- 非 `2xx`：恢复失败
-- `service_url` 为空：不可继续后续调用
-
-### 1.2 Runtime API
-
-运行时服务基地址使用 `recover` 返回的 `service_url`。
-
-默认启动端口：`10083`。
-
-对客户开放的接口：
-
-- `GET /health`
-- `POST /run_with_files`
-- `GET /queue_status`
-- `GET /request_status`
-
-说明：
-
-- 生成完成后的模型文件不通过 Runtime API 直接返回二进制内容。
-- 最终结果通过 `request_status` 返回的 `result.artifacts.glb.url` 提供下载与预览。
-- 服务空闲后会自动释放算力，客户侧无需额外调用暂停接口。
-
-## 2. 调用顺序
-
-1. `POST {task_manager}/api/task/recover`
-2. `GET {service_url}/health`，轮询至可用
-3. `POST {service_url}/run_with_files`
-4. 轮询任务状态
-   - `GET {service_url}/queue_status?request_id=...`
-   - `GET {service_url}/request_status?request_id=...`
-5. 读取 `result.artifacts.glb.url`，用于下载或在线预览
-
-## 3. 接口定义
-
-### 3.1 `GET /health`
-
-请求参数：无
-
-响应示例：
-
-```json
-{
-  "status": "ok"
-}
-```
-
-### 3.2 `POST /run_with_files`
-
-请求类型：`multipart/form-data`
-
-用途：上传单张图片并创建 3D 生成任务。
-
-#### 3.2.1 表单参数
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `image` | file | 是 | 无 | 输入图片，仅支持单张 |
-| `request_id` | string | 否 | 自动生成 | 客户端请求 ID，建议使用 UUID |
+| `request_id` | string | 否 | 自动生成 | 客户端请求 ID，建议用于链路追踪 |
+
+#### `parameters` 字段
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
 | `precision` | string | 否 | `standard` | 推理预设 |
-| `steps` | integer | 否 | 预设值 | 推理步数 |
+| `steps` | integer | 否 | 预设值 | 采样步数 |
 | `octree_res` | integer | 否 | 预设值 | 八叉树分辨率 |
-| `num_latents` | integer | 否 | 预设值 | Latent 数量 |
+| `num_latents` | integer | 否 | 预设值 | latent 数量 |
 | `chunk_size` | integer | 否 | 预设值 | 分块大小 |
 | `seed` | integer | 否 | `42` | 随机种子 |
-| `remove_bg` | boolean | 否 | `false` | 是否移除背景 |
-| `scale` | float | 否 | `0.99` | 模型归一化比例 |
+| `remove_bg` | boolean | 否 | `false` | 是否先移除背景 |
+| `scale` | number | 否 | `0.99` | 输出模型归一化比例 |
 
 上传限制：
 
-- 单次仅支持 `1` 张图片
+- 当前仅支持 `1` 张图片
 - 支持格式：`PNG`、`JPG`、`JPEG`、`WEBP`、`BMP`
 
-成功响应：
-
-```json
-{
-  "status": "queued",
-  "request_id": "0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
-  "position": 1
-}
-```
-
-响应字段：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `status` | string | 固定为 `queued` |
-| `request_id` | string | 请求 ID |
-| `position` | integer | 当前排队位置，`1` 表示队首 |
-
-错误码：
-
-- `400`：上传文件为空、类型不合法，或上传数量不符合要求
-- `409`：`request_id` 与队列中的待处理/处理中任务冲突
-- `422`：表单参数校验失败
-- `429`：队列已满
-
-请求示例：
+### 5.5 请求示例
 
 ```bash
-curl -X POST "http://127.0.0.1:10083/run_with_files" \
-  -F "image=@/path/to/input.png" \
-  -F "request_id=req-001" \
-  -F "precision=standard"
+curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction' \
+  -H 'Authorization: Bearer <YOUR_API_KEY>' \
+  -F 'request={
+    "model":"kokoni-ultrashape",
+    "input":{
+      "request_id":"req-001"
+    },
+    "parameters":{
+      "precision":"standard",
+      "seed":42,
+      "remove_bg":false,
+      "scale":0.99
+    }
+  }' \
+  -F 'files=@/path/to/input.png'
 ```
 
-### 3.3 `GET /queue_status`
-
-Query 参数：
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `request_id` | string | 否 | 指定后返回该请求的排队信息 |
-
-响应字段：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `processing` | boolean | 当前是否存在执行中的任务 |
-| `pending` | integer | 当前等待队列中的任务数 |
-| `current_request_id` | string | 当前执行中的请求 ID，无则为空字符串 |
-| `status` | string | 队列状态或指定请求状态 |
-| `position` | integer | 指定 `request_id` 时返回 |
-
-`status` 取值说明：
-
-- 未传 `request_id`：`processing` / `pending` / `idle`
-- 传入 `request_id`：`pending` / `processing` / `completed` / `failed` / `unknown`
-
-`position` 规则：
-
-- `0`：请求正在处理
-- `>=1`：请求在等待队列中，`1` 表示队首
-- `-1`：请求不存在，或已不在等待队列中
-
-响应示例：
+### 5.6 成功响应示例
 
 ```json
 {
-  "processing": true,
-  "pending": 2,
-  "current_request_id": "e5ab13d4-2f13-4a26-a6a4-bf2bc0f151f4",
-  "status": "pending",
-  "position": 1
+  "status_code": 200,
+  "request_id": "req-001",
+  "code": null,
+  "message": "",
+  "output": {
+    "task_id": "44c6f1f6f2ff42889d29aafec6c64a7a",
+    "task_status": "PENDING",
+    "submit_time": "2026-03-12 10:20:30.456"
+  }
 }
 ```
 
-### 3.4 `GET /request_status`
+## 6. 查询任务状态
 
-Query 参数：
+### 6.1 请求地址
+
+```text
+GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
+```
+
+### 6.2 路径参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `request_id` | string | 是 | 请求 ID |
+| `task_id` | string | 是 | 创建任务接口返回的任务 ID |
 
-错误码：
+### 6.3 任务状态说明
 
-- `400`：`request_id` 为空
-- `404`：未找到对应请求
+| 状态 | 说明 |
+|---|---|
+| `PENDING` | 任务已创建，等待平台调度 |
+| `SCALING` | 平台正在恢复算力或等待可用节点 |
+| `RUNNING` | 任务正在执行 UltraShape 细化 |
+| `SUCCEEDED` | 任务完成，可读取结果 |
+| `FAILED` | 任务失败，请查看 `message` |
 
-响应字段：
+### 6.4 查询响应字段
+
+响应根级字段固定如下：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
+| `status_code` | integer | 接口状态码 |
 | `request_id` | string | 请求 ID |
-| `status` | string | `pending` / `processing` / `completed` / `failed` |
-| `error` | string | 失败原因，成功时为空字符串 |
-| `created_at` | number | 创建时间，Unix 时间戳（秒） |
-| `started_at` | number \| null | 开始处理时间，Unix 时间戳（秒） |
-| `finished_at` | number \| null | 处理结束时间，Unix 时间戳（秒） |
-| `result` | object | 结果对象，任务完成后返回 |
+| `code` | string \| null | 业务码 |
+| `message` | string | 状态说明或错误信息 |
+| `output` | object | 任务信息与结果 |
 
-`result.artifacts` 关键字段：
+`output` 中固定包含：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `input_image.oss_key` | string | 输入图片 OSS 路径 |
-| `input_image.url` | string | 输入图片签名访问地址 |
-| `glb.oss_key` | string | 输出 GLB 的 OSS 路径 |
-| `glb.url` | string | 输出 GLB 的签名下载地址 |
+| `task_id` | string | 任务 ID |
+| `task_status` | string | 任务状态 |
+| `submit_time` | string | 提交时间 |
+| `scheduled_time` | string \| null | 调度时间 |
+| `start_time` | string \| null | 开始执行时间 |
+| `end_time` | string \| null | 结束时间 |
 
-成功响应示例：
+任务成功后，`output` 中还会包含以下关键结果字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `session_id` | string | 运行会话 ID |
+| `glb_url` | string | 细化后 GLB 下载地址 |
+| `model_url` | string | 与 `glb_url` 等价的兼容字段 |
+| `oss_prefix` | string | 本次任务的 OSS 前缀 |
+| `artifacts.input_image.oss_key` | string | 输入图片 OSS 路径 |
+| `artifacts.input_image.url` | string | 输入图片签名下载地址 |
+| `artifacts.glb.oss_key` | string | 输出 GLB 的 OSS 路径 |
+| `artifacts.glb.url` | string | 输出 GLB 的签名下载地址 |
+
+### 6.5 查询示例
+
+```bash
+curl --location 'http://36.133.236.108:8090/api/v1/tasks/44c6f1f6f2ff42889d29aafec6c64a7a' \
+  -H 'Authorization: Bearer <YOUR_API_KEY>'
+```
+
+### 6.6 成功完成响应示例
 
 ```json
 {
-  "request_id": "0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
-  "status": "completed",
-  "error": "",
-  "created_at": 1773086400.123,
-  "started_at": 1773086402.581,
-  "finished_at": 1773086468.004,
-  "result": {
-    "request_id": "0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
-    "oss_prefix": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
+  "status_code": 200,
+  "request_id": "req-001",
+  "code": null,
+  "message": "",
+  "output": {
+    "task_id": "44c6f1f6f2ff42889d29aafec6c64a7a",
+    "task_status": "SUCCEEDED",
+    "submit_time": "2026-03-12 10:20:30.456",
+    "scheduled_time": "2026-03-12 10:20:35.000",
+    "start_time": "2026-03-12 10:20:38.200",
+    "end_time": "2026-03-12 10:22:01.123",
+    "session_id": "req-001",
+    "glb_url": "https://example.com/refined.glb",
+    "model_url": "https://example.com/refined.glb",
+    "oss_prefix": "docker-input&output/ultrashape/req-001",
     "artifacts": {
       "input_image": {
-        "oss_key": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/input/input.png",
+        "oss_key": "docker-input&output/ultrashape/req-001/input/input.png",
         "url": "https://example.com/input.png?..."
       },
       "glb": {
-        "oss_key": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/output/refined.glb",
+        "oss_key": "docker-input&output/ultrashape/req-001/output/refined.glb",
         "url": "https://example.com/refined.glb?..."
       }
     }
@@ -234,33 +242,41 @@ Query 参数：
 }
 ```
 
-失败响应示例：
+## 7. 推荐调用方式
 
-```json
-{
-  "request_id": "0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
-  "status": "failed",
-  "error": "Queue is full, try again later",
-  "created_at": 1773086400.123,
-  "started_at": null,
-  "finished_at": 1773086400.456,
-  "result": {}
-}
-```
+建议客户端按以下方式接入：
 
-## 4. 客户端轮询建议
+1. 调用创建任务接口，获取 `task_id`
+2. 每 `2` 秒轮询一次任务状态接口
+3. 当 `task_status=SUCCEEDED` 时读取 `output.glb_url`
+4. 当 `task_status=FAILED` 时展示 `message`
 
-- 提交任务后立即保存 `request_id`
-- 以 `2` 秒间隔轮询 `queue_status` 与 `request_status`
-- `request_status.status=completed` 后，直接读取 `result.artifacts.glb.url`
-- `request_status.status=failed` 时，以 `error` 字段作为失败原因展示
+## 8. 错误处理建议
 
-## 5. 前端对接说明
+常见场景如下：
 
-`3d_preview.html` 的默认行为：
+| 场景 | 建议处理方式 |
+|---|---|
+| `401 Unauthorized` | 检查 Bearer Token 是否缺失或无效 |
+| 请求参数不合法 | 根据接口返回信息修正请求后重试 |
+| 文件为空或格式不支持 | 检查上传内容 |
+| 任务长时间处于 `SCALING` | 平台正在准备可用算力，可继续轮询 |
+| 任务返回 `FAILED` | 展示 `message`，并根据业务决定是否重新提交 |
+| 查询接口返回 `404` | 检查 `task_id` 是否正确 |
 
-- 页面加载后不主动恢复任务
-- 用户点击“开始生成”时调用 `recover`
-- 后端健康检查通过后提交 `run_with_files`
-- 轮询状态直至获取 `glb.url`
-- 使用 `glb.url` 加载模型预览，并将同一地址用于“下载当前 GLB”
+## 9. Runtime 兼容接口
+
+以下接口主要用于内部调试、旧版接入或 runtime 直连，不建议作为新的公共接入方式：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/health` | 运行时健康检查 |
+| `POST` | `/reconstruct` | task-manager 转发到 runtime 的内部兼容入口 |
+| `POST` | `/run_with_files` | 旧版排队接口 |
+| `GET` | `/queue_status` | 旧版排队状态接口 |
+| `GET` | `/request_status` | 旧版请求状态接口 |
+| `POST` | `/generate` | 直出 GLB 下载跳转 |
+| `POST` | `/generate_3d` | base64 入参的同步接口 |
+| `POST` | `/api/v1/services/aigc/3d-refine/generation` | runtime 自身的异步接口 |
+
+新前端页面 `ultrashape/3d-preview/3d_preview.html` 默认已切换为公共百炼风格 API，不再依赖 `recover -> runtime` 的旧链路。

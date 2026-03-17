@@ -113,6 +113,8 @@ OSS_BUCKET = os.environ.get("ULTRASHAPE_OSS_BUCKET", "kokokoni")
 OSS_PREFIX = os.environ.get("ULTRASHAPE_OSS_PREFIX", "docker-input&output/ultrashape").strip("/")
 OSS_SIGN_EXPIRES = os.environ.get("ULTRASHAPE_OSS_SIGN_EXPIRES", "24h")
 TMP_ROOT = os.environ.get("ULTRASHAPE_TMP_ROOT", "/tmp/ultrashape-oss-workspace")
+TASK_MANAGER_API_KEY = os.environ.get("TASK_MANAGER_API_KEY", "").strip()
+ULTRASHAPE_QUEUE_WORKERS = int(os.environ.get("ULTRASHAPE_QUEUE_WORKERS", "0"))
 
 _CONDA_SH_CACHE = None
 TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
@@ -173,13 +175,17 @@ class RequestRecord:
     result: dict[str, Any] = field(default_factory=dict)
 
 
-class SingleWorkerTaskQueue:
+class NodeBusyError(RuntimeError):
+    """Raised when no execution slot is currently available."""
+
+
+class ConcurrentTaskQueue:
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._pending: list[tuple[str, Any]] = []
-        self._current_request_id: str | None = None
+        self._active_request_ids: set[str] = set()
         self._records: dict[str, RequestRecord] = {}
-        self._worker: threading.Thread | None = None
+        self._workers: list[threading.Thread] = []
         self._running = False
         self._idle_callback: Any = None
 
@@ -187,20 +193,25 @@ class SingleWorkerTaskQueue:
         self,
         handler: Any,
         *,
+        worker_count: int = 1,
         idle_callback: Any = None,
     ) -> None:
         with self._cond:
-            if self._worker and self._worker.is_alive():
+            if any(worker.is_alive() for worker in self._workers):
                 return
             self._idle_callback = idle_callback
             self._running = True
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                args=(handler,),
-                daemon=True,
-                name="ultrashape-run-queue-worker",
-            )
-            self._worker.start()
+            self._workers = []
+            total = max(1, int(worker_count or 1))
+            for index in range(total):
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    args=(handler,),
+                    daemon=True,
+                    name=f"ultrashape-run-queue-worker-{index}",
+                )
+                self._workers.append(worker)
+                worker.start()
 
     def enqueue(
         self,
@@ -225,10 +236,13 @@ class SingleWorkerTaskQueue:
 
     def get_queue_status(self, request_id: str | None = None) -> dict[str, Any]:
         with self._cond:
+            active_request_ids = sorted(self._active_request_ids)
             payload: dict[str, Any] = {
-                "processing": self._current_request_id is not None,
+                "processing": bool(active_request_ids),
+                "processing_count": len(active_request_ids),
                 "pending": len(self._pending),
-                "current_request_id": self._current_request_id or "",
+                "current_request_id": active_request_ids[0] if active_request_ids else "",
+                "processing_request_ids": active_request_ids,
             }
             if request_id is not None:
                 rid = request_id.strip()
@@ -236,7 +250,7 @@ class SingleWorkerTaskQueue:
                 payload["position"] = self._position_for_request_unlocked(rid)
             else:
                 payload["status"] = (
-                    "processing" if self._current_request_id else ("pending" if self._pending else "idle")
+                    "processing" if active_request_ids else ("pending" if self._pending else "idle")
                 )
             return payload
 
@@ -263,7 +277,7 @@ class SingleWorkerTaskQueue:
 
     def is_idle(self) -> bool:
         with self._cond:
-            return self._current_request_id is None and not self._pending
+            return not self._active_request_ids and not self._pending
 
     def _worker_loop(self, handler: Any) -> None:
         while True:
@@ -273,7 +287,7 @@ class SingleWorkerTaskQueue:
                 if not self._running:
                     return
                 request_id, payload = self._pending.pop(0)
-                self._current_request_id = request_id
+                self._active_request_ids.add(request_id)
                 record = self._records[request_id]
                 record.status = "processing"
                 record.error = ""
@@ -300,9 +314,8 @@ class SingleWorkerTaskQueue:
             finally:
                 should_trigger_idle = False
                 with self._cond:
-                    if self._current_request_id == request_id:
-                        self._current_request_id = None
-                    should_trigger_idle = not self._pending and self._current_request_id is None
+                    self._active_request_ids.discard(request_id)
+                    should_trigger_idle = not self._pending and not self._active_request_ids
                 if should_trigger_idle and self._idle_callback:
                     try:
                         self._idle_callback()
@@ -312,7 +325,7 @@ class SingleWorkerTaskQueue:
     def _position_for_request_unlocked(self, request_id: str) -> int:
         if not request_id:
             return -1
-        if request_id == self._current_request_id:
+        if request_id in self._active_request_ids:
             return 0
         return self._pending_position_unlocked(request_id)
 
@@ -335,8 +348,7 @@ def _build_refine_options(params: Optional[RefineParameters] = None) -> Dict[str
     return resolve_refine_options(_model_dump(params, exclude_none=True))
 
 
-EXECUTION_LOCK = threading.Lock()
-RUN_QUEUE = SingleWorkerTaskQueue()
+RUN_QUEUE = ConcurrentTaskQueue()
 QUEUE_ACTIVITY_LOCK = threading.Lock()
 QUEUE_ACTIVITY_SEQ = 0
 
@@ -610,8 +622,17 @@ def _init_slots() -> None:
         print(f"[scheduler] slots ready: {slot_ids}")
 
 
-def _acquire_slot() -> Dict[str, str]:
-    slot = SLOT_QUEUE.get()
+def _acquire_slot(*, block: bool = True, timeout: float | None = None) -> Dict[str, str]:
+    try:
+        if block:
+            if timeout is None:
+                slot = SLOT_QUEUE.get()
+            else:
+                slot = SLOT_QUEUE.get(timeout=timeout)
+        else:
+            slot = SLOT_QUEUE.get_nowait()
+    except queue.Empty as exc:
+        raise NodeBusyError("node busy") from exc
     print(f"[scheduler] acquired slot {slot['slot_id']}")
     return slot
 
@@ -621,12 +642,21 @@ def _release_slot(slot: Dict[str, str]) -> None:
     print(f"[scheduler] released slot {slot['slot_id']}")
 
 
-def _post_json(url: str, payload: Dict[str, object], timeout: float) -> Dict[str, object]:
+def _post_json(
+    url: str,
+    payload: Dict[str, object],
+    timeout: float,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, object]:
     data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=req_headers,
         method="POST",
     )
     try:
@@ -769,8 +799,16 @@ def _call_task_manager_pause() -> None:
         print("[task-manager] TASK_MANAGER_BASE empty, skip pause")
         return
     payload = {"project": TASK_MANAGER_PROJECT}
+    headers: Dict[str, str] = {}
+    if TASK_MANAGER_API_KEY:
+        headers["Authorization"] = f"Bearer {TASK_MANAGER_API_KEY}"
     try:
-        _post_json(f"{TASK_MANAGER_BASE}/api/task/pause", payload, timeout=30)
+        _post_json(
+            f"{TASK_MANAGER_BASE}/api/task/pause",
+            payload,
+            timeout=30,
+            headers=headers,
+        )
         print(f"[task-manager] paused project={TASK_MANAGER_PROJECT}")
     except Exception as exc:
         print(f"[task-manager] pause failed: {exc}")
@@ -1174,6 +1212,8 @@ def _run_refinement_job(
     image_bytes: bytes,
     upload_name: str,
     params: Optional[RefineParameters] = None,
+    *,
+    wait_for_slot: bool = True,
 ) -> dict[str, Any]:
     _ensure_dirs()
     _init_slots()
@@ -1183,31 +1223,30 @@ def _run_refinement_job(
     coarse_mesh_path = os.path.join(workspace_dir, "coarse.glb")
     refined_path = os.path.join(workspace_dir, "refined.glb")
     oss_prefix_root = _join_oss_key(OSS_PREFIX, request_id)
-    slot = _acquire_slot()
+    slot = _acquire_slot(block=wait_for_slot)
 
     _write_binary(input_image_path, image_bytes)
     print(f"[api] request={request_id} workspace={workspace_dir}")
 
     try:
-        with EXECUTION_LOCK:
-            if USE_REMOTE_SERVICES:
-                coarse_mesh_bytes = _call_hunyuan_service(image_bytes, slot["hunyuan_url"])
-                refined_mesh_bytes = _call_ultrashape_service(
-                    image_bytes,
-                    coarse_mesh_bytes,
-                    slot["ultrashape_url"],
-                    params,
-                )
-                _write_binary(refined_path, refined_mesh_bytes)
-            else:
-                _run_hunyuan(input_image_path, coarse_mesh_path, slot["hunyuan_device"])
-                refined_path = _run_ultrashape(
-                    input_image_path,
-                    coarse_mesh_path,
-                    workspace_dir,
-                    slot["ultrashape_device"],
-                    params,
-                )
+        if USE_REMOTE_SERVICES:
+            coarse_mesh_bytes = _call_hunyuan_service(image_bytes, slot["hunyuan_url"])
+            refined_mesh_bytes = _call_ultrashape_service(
+                image_bytes,
+                coarse_mesh_bytes,
+                slot["ultrashape_url"],
+                params,
+            )
+            _write_binary(refined_path, refined_mesh_bytes)
+        else:
+            _run_hunyuan(input_image_path, coarse_mesh_path, slot["hunyuan_device"])
+            refined_path = _run_ultrashape(
+                input_image_path,
+                coarse_mesh_path,
+                workspace_dir,
+                slot["ultrashape_device"],
+                params,
+            )
 
         input_oss_key = _join_oss_key(oss_prefix_root, "input", file_name)
         output_oss_key = _join_oss_key(oss_prefix_root, "output", "refined.glb")
@@ -1215,7 +1254,11 @@ def _run_refinement_job(
         glb_artifact = _upload_artifact(refined_path, output_oss_key)
 
         return {
+            "request_id": request_id,
+            "session_id": request_id,
             "oss_prefix": oss_prefix_root,
+            "glb_url": glb_artifact["url"],
+            "model_url": glb_artifact["url"],
             "artifacts": {
                 "input_image": input_artifact,
                 "glb": glb_artifact,
@@ -1245,16 +1288,16 @@ def _execute_run_request(request_id: str, payload: dict[str, Any]) -> dict[str, 
     upload_name = str(payload.get("upload_name") or "input-image.png")
     params_data = payload.get("params") or {}
     params = RefineParameters(**params_data) if params_data else None
-    result = _run_refinement_job(request_id, image_bytes, upload_name, params)
-    return {
-        "request_id": request_id,
-        "artifacts": result["artifacts"],
-        "oss_prefix": result["oss_prefix"],
-    }
+    return _run_refinement_job(request_id, image_bytes, upload_name, params)
 
 
 def _start_worker() -> None:
-    RUN_QUEUE.start(_execute_run_request, idle_callback=_schedule_pause_if_idle)
+    worker_count = ULTRASHAPE_QUEUE_WORKERS if ULTRASHAPE_QUEUE_WORKERS > 0 else len(SLOTS)
+    RUN_QUEUE.start(
+        _execute_run_request,
+        worker_count=max(1, worker_count),
+        idle_callback=_schedule_pause_if_idle,
+    )
 
 
 @app.on_event("startup")
@@ -1332,7 +1375,7 @@ def _enqueue_request(
 ) -> tuple[str, int]:
     if TASK_QUEUE_MAXSIZE > 0:
         queue_status = RUN_QUEUE.get_queue_status()
-        active_count = int(queue_status.get("pending", 0)) + (1 if queue_status.get("processing") else 0)
+        active_count = int(queue_status.get("pending", 0)) + int(queue_status.get("processing_count", 0))
         if active_count >= TASK_QUEUE_MAXSIZE:
             raise HTTPException(status_code=429, detail="Queue is full, try again later")
 
@@ -1361,6 +1404,55 @@ def request_status(request_id: str):
     if not payload:
         raise HTTPException(status_code=404, detail="request_id not found")
     return payload
+
+
+@app.post("/reconstruct")
+async def reconstruct(
+    image: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    request_id: str = Form(""),
+    time_interval: float = Form(1.0),  # compatible with task-manager hunyuanworld adapter
+    frame_selector: str = Form("All"),  # compatible with task-manager hunyuanworld adapter
+    show_camera: bool = Form(True),  # accepted for compatibility, unused by ultrashape
+    show_mesh: bool = Form(True),  # accepted for compatibility, unused by ultrashape
+    filter_sky_bg: bool = Form(False),  # accepted for compatibility, unused by ultrashape
+    filter_ambiguous: bool = Form(True),  # accepted for compatibility, unused by ultrashape
+    precision: str = Form("standard"),
+    steps: Optional[int] = Form(None),
+    octree_res: Optional[int] = Form(None),
+    num_latents: Optional[int] = Form(None),
+    chunk_size: Optional[int] = Form(None),
+    seed: Optional[int] = Form(42),
+    remove_bg: Optional[bool] = Form(False),
+    scale: Optional[float] = Form(0.99),
+):
+    del time_interval, frame_selector, show_camera, show_mesh, filter_sky_bg, filter_ambiguous
+    uploads = [item for item in ([image] if image else []) if item is not None]
+    if files:
+        uploads.extend(files)
+    upload = _ensure_image_upload(uploads)
+    image_bytes = await _read_upload_bytes(upload)
+    params = _build_params_from_form(
+        precision=precision,
+        steps=steps,
+        octree_res=octree_res,
+        num_latents=num_latents,
+        chunk_size=chunk_size,
+        seed=seed,
+        remove_bg=remove_bg,
+        scale=scale,
+    )
+    rid = request_id.strip() or uuid.uuid4().hex
+    try:
+        return _run_refinement_job(
+            rid,
+            image_bytes,
+            _safe_filename(upload.filename),
+            params,
+            wait_for_slot=False,
+        )
+    except NodeBusyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/run_with_files")
@@ -1489,11 +1581,13 @@ async def get_task(task_id: str):
         "output": {
             "task_id": task_id,
             "task_status": _legacy_task_status(str(payload.get("status") or "")),
-            "model_url": glb.get("url", ""),
+            "glb_url": result.get("glb_url") or glb.get("url", ""),
+            "model_url": result.get("model_url") or glb.get("url", ""),
             "result_url": f"/api/v1/tasks/{task_id}/result",
             "submit_time": _format_timestamp(payload.get("created_at")),
             "end_time": _format_timestamp(payload.get("finished_at")),
             "error_message": payload.get("error", ""),
+            "session_id": result.get("session_id") or task_id,
             "artifacts": artifacts,
         },
         "usage": None,
