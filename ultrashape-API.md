@@ -14,7 +14,7 @@
 当前公共服务地址（下文中的 `base_url`）：
 
 ```text
-http://36.133.236.108:8090
+http://36.133.236.108:8091
 ```
 
 ## 3. 鉴权
@@ -37,7 +37,7 @@ http://36.133.236.108:8090
 ### 5.1 请求地址
 
 ```text
-POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction
+POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction
 ```
 
 ### 5.2 请求类型
@@ -109,7 +109,7 @@ POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstructio
 ### 5.5 请求示例
 
 ```bash
-curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction' \
+curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction' \
   -H 'Authorization: Bearer <YOUR_API_KEY>' \
   -F 'request={
     "model":"kokoni-ultrashape",
@@ -147,7 +147,7 @@ curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/r
 ### 6.1 请求地址
 
 ```text
-GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
+GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 ```
 
 ### 6.2 路径参数
@@ -205,7 +205,7 @@ GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
 ### 6.5 查询示例
 
 ```bash
-curl --location 'http://36.133.236.108:8090/api/v1/tasks/44c6f1f6f2ff42889d29aafec6c64a7a' \
+curl --location 'http://36.133.236.108:8091/api/v1/tasks/44c6f1f6f2ff42889d29aafec6c64a7a' \
   -H 'Authorization: Bearer <YOUR_API_KEY>'
 ```
 
