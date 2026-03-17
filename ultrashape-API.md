@@ -1,6 +1,4 @@
-# UltraShape API 文档
-
-适用默认项目：`ultrashape`
+# kokoni-shape API 文档
 
 ## 1. 服务地址
 
@@ -8,12 +6,13 @@
 
 - 默认地址：`http://36.133.236.108:8090`
 - 恢复任务：`POST /api/task/recover`
+- 鉴权方式：`Authorization: Bearer <YOUR_KOKONI_SHAPE_TOKEN>`
 
 请求体：
 
 ```json
 {
-  "project": "ultrashape"
+  "project": "kokoni-shape"
 }
 ```
 
@@ -28,6 +27,33 @@
 
 - 非 `2xx`：恢复失败
 - `service_url` 为空：不可继续后续调用
+
+鉴权使用方式：
+
+- 请求 Task-Manager 接口时，需要在 HTTP Header 中附带 `Authorization`
+- Header 格式为：`Authorization: Bearer <YOUR_KOKONI_SHAPE_TOKEN>`
+- 目前需要携带鉴权的接口包括：
+  - `POST /api/task/recover`
+  - `POST /api/task/pause`
+  - `GET /api/task/status?project=kokoni-shape`
+
+调用示例：
+
+```bash
+curl -X POST "http://36.133.236.108:8090/api/task/recover" \
+  -H "Authorization: Bearer <YOUR_KOKONI_SHAPE_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "kokoni-shape"
+  }'
+```
+
+查询状态示例：
+
+```bash
+curl "http://36.133.236.108:8090/api/task/status?project=kokoni-shape" \
+  -H "Authorization: Bearer <YOUR_KOKONI_SHAPE_TOKEN>"
+```
 
 ### 1.2 Runtime API
 
@@ -219,14 +245,14 @@ Query 参数：
   "finished_at": 1773086468.004,
   "result": {
     "request_id": "0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
-    "oss_prefix": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
+    "oss_prefix": "docker-input&output/kokoni-shape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377",
     "artifacts": {
       "input_image": {
-        "oss_key": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/input/input.png",
+        "oss_key": "docker-input&output/kokoni-shape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/input/input.png",
         "url": "https://example.com/input.png?..."
       },
       "glb": {
-        "oss_key": "docker-input&output/ultrashape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/output/refined.glb",
+        "oss_key": "docker-input&output/kokoni-shape/0bbf1d97-2b20-4a1f-8d2c-5a9efbd1f377/output/refined.glb",
         "url": "https://example.com/refined.glb?..."
       }
     }
