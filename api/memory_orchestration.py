@@ -46,8 +46,8 @@ def run_remote_refinement_pipeline(
     slot_id = str(slot.get("slot_id") or "?")
     hunyuan_url = str(slot["hunyuan_url"])
     ultrashape_url = str(slot["ultrashape_url"])
-    normalized_hunyuan_action = normalize_memory_action(hunyuan_post_action, default="unload")
-    normalized_ultrashape_action = normalize_memory_action(ultrashape_post_action, default="offload")
+    normalized_hunyuan_action = normalize_memory_action(hunyuan_post_action, default="none")
+    normalized_ultrashape_action = normalize_memory_action(ultrashape_post_action, default="none")
 
     def emit(service_name: str, action: str, **extra: object) -> None:
         if log_stage is None:
@@ -72,7 +72,7 @@ def run_remote_refinement_pipeline(
         if normalized_hunyuan_action != "none":
             emit("hunyuan", "memory_action", memory_action=normalized_hunyuan_action)
             apply_memory_action(hunyuan_url, normalized_hunyuan_action, "hunyuan")
-        if stop_service is not None and hunyuan_started:
+        if stop_service is not None and hunyuan_started and normalized_hunyuan_action != "none":
             emit("hunyuan", "stop")
             stop_service("hunyuan", slot)
             hunyuan_started = False
@@ -83,12 +83,12 @@ def run_remote_refinement_pipeline(
         emit("ultrashape", "inference_start")
         return call_ultrashape(image_bytes, coarse_mesh_bytes, ultrashape_url, params)
     finally:
-        if stop_service is not None and hunyuan_started:
+        if stop_service is not None and hunyuan_started and normalized_hunyuan_action != "none":
             emit("hunyuan", "stop")
             stop_service("hunyuan", slot)
         if ultrashape_started and normalized_ultrashape_action != "none":
             emit("ultrashape", "memory_action", memory_action=normalized_ultrashape_action)
             apply_memory_action(ultrashape_url, normalized_ultrashape_action, "ultrashape")
-        if stop_service is not None and ultrashape_started:
+        if stop_service is not None and ultrashape_started and normalized_ultrashape_action != "none":
             emit("ultrashape", "stop")
             stop_service("ultrashape", slot)

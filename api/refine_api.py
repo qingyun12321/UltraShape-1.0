@@ -118,10 +118,10 @@ OSS_SIGN_EXPIRES = os.environ.get("ULTRASHAPE_OSS_SIGN_EXPIRES", "24h")
 TMP_ROOT = os.environ.get("ULTRASHAPE_TMP_ROOT", "/tmp/ultrashape-oss-workspace")
 ULTRASHAPE_QUEUE_WORKERS = int(os.environ.get("ULTRASHAPE_QUEUE_WORKERS", "0"))
 HUNYUAN_POST_ACTION = normalize_memory_action(
-    os.environ.get("HUNYUAN_POST_ACTION"), default="unload"
+    os.environ.get("HUNYUAN_POST_ACTION"), default="none"
 )
 ULTRASHAPE_POST_ACTION = normalize_memory_action(
-    os.environ.get("ULTRASHAPE_POST_ACTION"), default="offload"
+    os.environ.get("ULTRASHAPE_POST_ACTION"), default="none"
 )
 
 _CONDA_SH_CACHE = None
@@ -1631,6 +1631,7 @@ def _bootstrap_runtime() -> None:
             slots = list(SLOTS)
         for slot in slots:
             _ensure_slot_service_ready("hunyuan", slot)
+            _ensure_slot_service_ready("ultrashape", slot)
         _update_bootstrap_status(slots_ready=True)
         _update_bootstrap_status(
             state="ready",
