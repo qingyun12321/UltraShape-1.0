@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import gc
 import io
 import os
 import sys
@@ -15,8 +16,10 @@ import uvicorn
 
 API_ROOT = os.path.dirname(os.path.abspath(__file__))
 ULTRASHAPE_ROOT = os.path.abspath(os.path.join(API_ROOT, ".."))
-if ULTRASHAPE_ROOT not in sys.path:
-    sys.path.insert(0, ULTRASHAPE_ROOT)
+WORKSPACE_ROOT = os.path.abspath(os.path.join(ULTRASHAPE_ROOT, ".."))
+for path in (ULTRASHAPE_ROOT, WORKSPACE_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 ULTRASHAPE_VISIBLE_DEVICES = os.environ.get("ULTRASHAPE_CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -24,7 +27,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", ULTRASHAPE_VISIBLE_DEVICES)
 
 import torch
 
-from refine_presets import resolve_refine_options
+from refine_presets import DEFAULT_PRECISION, resolve_refine_options
+from runtime_diagnostics import format_runtime_diagnostics
 from ultrashape.rembg import BackgroundRemover
 from ultrashape.utils.misc import instantiate_from_config
 from ultrashape.surface_loaders import SharpEdgeSurfaceLoader
@@ -61,7 +65,7 @@ app = FastAPI(title="UltraShape Refine Service")
 class RefineRequest(BaseModel):
     image_base64: str
     mesh_base64: str
-    precision: Optional[str] = "standard"
+    precision: Optional[str] = DEFAULT_PRECISION
     steps: Optional[int] = None
     octree_res: Optional[int] = None
     num_latents: Optional[int] = None
@@ -98,6 +102,17 @@ def _parse_keep_on_gpu(value: str) -> set:
 
 
 KEEP_ON_GPU = _parse_keep_on_gpu(KEEP_ON_GPU_RAW)
+
+
+def _log_runtime_diagnostics(stage: str, **extra: object) -> None:
+    print(
+        format_runtime_diagnostics(
+            f"ultrashape:{stage}",
+            torch_module=torch,
+            extra={key: value for key, value in extra.items() if value is not None},
+        ),
+        flush=True,
+    )
 
 
 def _cancel_idle_offload() -> None:
@@ -214,10 +229,43 @@ def _ensure_models() -> None:
     global PIPELINE, LOADER, REMBG, TOKEN_NUM, VOXEL_RES
     if PIPELINE is not None:
         return
+    _log_runtime_diagnostics("before_load", ckpt_path=CKPT_PATH, device=DEVICE.type)
     PIPELINE, TOKEN_NUM, VOXEL_RES, LOADER = _load_models()
+    _log_runtime_diagnostics(
+        "after_load",
+        ckpt_path=CKPT_PATH,
+        device=DEVICE.type,
+        token_num=TOKEN_NUM,
+        voxel_res=VOXEL_RES,
+    )
     if not LAZY_REMBG:
         REMBG = BackgroundRemover()
     _schedule_idle_offload()
+
+
+def _offload_models_now() -> None:
+    if PIPELINE is None:
+        return
+    _cancel_idle_offload()
+    _offload_pipeline_components(set())
+
+
+def _unload_models_now() -> None:
+    global PIPELINE, LOADER, REMBG, TOKEN_NUM, VOXEL_RES
+    _cancel_idle_offload()
+    if PIPELINE is not None:
+        try:
+            PIPELINE.to("cpu")
+        except Exception:
+            pass
+    PIPELINE = None
+    LOADER = None
+    REMBG = None
+    TOKEN_NUM = None
+    VOXEL_RES = None
+    gc.collect()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _prefetch_dino_model() -> None:
@@ -273,6 +321,12 @@ def _mesh_to_base64(mesh) -> str:
 
 @app.on_event("startup")
 def _startup() -> None:
+    _log_runtime_diagnostics(
+        "startup",
+        ckpt_path=CKPT_PATH,
+        device=DEVICE.type,
+        load_on_startup=LOAD_ON_STARTUP,
+    )
     if PREFETCH_DINO_ON_STARTUP:
         threading.Thread(target=_prefetch_dino_model, daemon=True, name="ultrashape-dino-prefetch").start()
     if LOAD_ON_STARTUP:
@@ -282,6 +336,30 @@ def _startup() -> None:
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready_check():
+    return {"status": "ok"}
+
+
+@app.get("/live")
+def live_check():
+    return {"status": "ok"}
+
+
+@app.post("/memory/offload")
+def memory_offload():
+    with PIPELINE_LOCK:
+        _offload_models_now()
+    return {"status": "ok", "action": "offload"}
+
+
+@app.post("/memory/unload")
+def memory_unload():
+    with PIPELINE_LOCK:
+        _unload_models_now()
+    return {"status": "ok", "action": "unload"}
 
 
 @app.post("/refine", response_model=RefineResponse)

@@ -182,3 +182,4 @@ cache/
 checkpoints/ultrashape_v1.pt
 checkpoints/*.pt
 checkpoints/*.ckpt
+api/tests/

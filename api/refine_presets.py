@@ -2,9 +2,11 @@ import os
 from typing import Any, Dict, Mapping, Optional
 
 
+DEFAULT_PRECISION = "balanced"
+
+
 PRESET_ALIASES = {
-    "default": "balanced",
-    "standard": "balanced",
+    "default": DEFAULT_PRECISION,
     "balanced": "balanced",
     "fast": "fast",
     "draft": "fast",
@@ -41,7 +43,7 @@ PRESET_OPTIONS = {
         "steps": 50,
         "octree_res": 1024,
         "num_latents": 32768,
-        "chunk_size": 2048,
+        "chunk_size": 8000,
     },
 }
 
@@ -72,8 +74,8 @@ def _env_bool(name: str) -> Optional[bool]:
 
 
 def normalize_precision(value: Optional[str]) -> str:
-    key = (value or _env_str("ULTRASHAPE_PRECISION") or "standard").strip().lower()
-    return PRESET_ALIASES.get(key, "balanced")
+    key = (value or _env_str("ULTRASHAPE_PRECISION") or DEFAULT_PRECISION).strip().lower()
+    return PRESET_ALIASES.get(key, DEFAULT_PRECISION)
 
 
 def resolve_refine_options(
@@ -112,9 +114,12 @@ def resolve_refine_options(
     for key, value in overrides.items():
         if value is None:
             continue
+        if key == "precision":
+            continue
         options[key] = value
 
     if options.get("num_latents") is None and fallback_num_latents is not None:
         options["num_latents"] = int(fallback_num_latents)
 
+    options["precision"] = normalized_precision
     return options

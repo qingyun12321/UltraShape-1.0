@@ -1,5 +1,6 @@
 import argparse
 import base64
+import contextlib
 import io
 import json
 import os
@@ -15,18 +16,16 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 import textwrap
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from PIL import Image
 import uvicorn
-
-from refine_presets import resolve_refine_options
 
 API_ROOT = os.path.dirname(os.path.abspath(__file__))
 ULTRASHAPE_ROOT = os.path.abspath(os.path.join(API_ROOT, ".."))
@@ -34,6 +33,12 @@ WORKSPACE_ROOT = os.path.abspath(os.path.join(ULTRASHAPE_ROOT, ".."))
 HUNYUAN_ROOT = os.environ.get(
     "HUNYUAN_ROOT", os.path.join(WORKSPACE_ROOT, "Hunyuan3D-2.1")
 )
+if WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, WORKSPACE_ROOT)
+
+from memory_orchestration import normalize_memory_action, run_remote_refinement_pipeline
+from refine_presets import DEFAULT_PRECISION, resolve_refine_options
+from runtime_diagnostics import format_process_exit_status, format_runtime_diagnostics
 
 MODEL_PATH = os.environ.get("HY3D_MODEL_PATH", "tencent/Hunyuan3D-2.1")
 ULTRASHAPE_CKPT = os.environ.get(
@@ -53,7 +58,7 @@ ULTRASHAPE_CACHE_DIR = os.environ.get(
 
 HUNYUAN_ENV = os.environ.get("HUNYUAN_ENV", "anta3d")
 HUNYUAN_CUDA_VISIBLE_DEVICES = os.environ.get(
-    "HUNYUAN_CUDA_VISIBLE_DEVICES", "1"
+    "HUNYUAN_CUDA_VISIBLE_DEVICES", "0"
 )
 ULTRASHAPE_ENV = os.environ.get("ULTRASHAPE_ENV", "ultrashape")
 ULTRASHAPE_CUDA_VISIBLE_DEVICES = os.environ.get(
@@ -94,6 +99,7 @@ ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST = os.environ.get(
     "ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST", ULTRASHAPE_CUDA_VISIBLE_DEVICES
 )
 SERVICE_TIMEOUT = float(os.environ.get("SERVICE_TIMEOUT", "1200"))
+MEMORY_ACTION_TIMEOUT = float(os.environ.get("MEMORY_ACTION_TIMEOUT", "120"))
 AUTO_START_LOCAL_SERVICES = os.environ.get("AUTO_START_LOCAL_SERVICES", "0") == "1"
 AUTO_START_HUNYUAN = os.environ.get("AUTO_START_HUNYUAN", "1") == "1"
 AUTO_START_ULTRASHAPE = os.environ.get("AUTO_START_ULTRASHAPE", "1") == "1"
@@ -106,15 +112,17 @@ HUNYUAN_SERVICE_PYTHON = os.environ.get(
 ULTRASHAPE_SERVICE_PYTHON = os.environ.get(
     "ULTRASHAPE_SERVICE_PYTHON", os.environ.get("PYTHON_BIN", sys.executable)
 )
-TASK_MANAGER_BASE = os.environ.get("TASK_MANAGER_BASE", "http://36.133.236.108:8090").rstrip("/")
-TASK_MANAGER_PROJECT = os.environ.get("TASK_MANAGER_PROJECT", "ultrashape")
-QUEUE_IDLE_PAUSE_DELAY_SEC = float(os.environ.get("QUEUE_IDLE_PAUSE_DELAY_SEC", "2"))
 OSS_BUCKET = os.environ.get("ULTRASHAPE_OSS_BUCKET", "kokokoni")
 OSS_PREFIX = os.environ.get("ULTRASHAPE_OSS_PREFIX", "docker-input&output/ultrashape").strip("/")
 OSS_SIGN_EXPIRES = os.environ.get("ULTRASHAPE_OSS_SIGN_EXPIRES", "24h")
 TMP_ROOT = os.environ.get("ULTRASHAPE_TMP_ROOT", "/tmp/ultrashape-oss-workspace")
-TASK_MANAGER_API_KEY = os.environ.get("TASK_MANAGER_API_KEY", "").strip()
 ULTRASHAPE_QUEUE_WORKERS = int(os.environ.get("ULTRASHAPE_QUEUE_WORKERS", "0"))
+HUNYUAN_POST_ACTION = normalize_memory_action(
+    os.environ.get("HUNYUAN_POST_ACTION"), default="unload"
+)
+ULTRASHAPE_POST_ACTION = normalize_memory_action(
+    os.environ.get("ULTRASHAPE_POST_ACTION"), default="offload"
+)
 
 _CONDA_SH_CACHE = None
 TASK_QUEUE_MAXSIZE = int(os.environ.get("TASK_QUEUE_MAXSIZE", "8"))
@@ -122,8 +130,9 @@ SLOT_QUEUE: "queue.Queue[Dict[str, str]]" = queue.Queue()
 SLOTS_LOCK = threading.Lock()
 SLOTS: List[Dict[str, str]] = []
 MANAGED_SERVICE_LOCK = threading.Lock()
-MANAGED_SERVICE_PROCS: List[subprocess.Popen] = []
-MANAGED_SERVICES_STARTED = False
+MANAGED_SERVICE_PROCS: List["ManagedServiceProcess"] = []
+BOOTSTRAP_LOCK = threading.Lock()
+BOOTSTRAP_THREAD: Optional[threading.Thread] = None
 
 app = FastAPI(title="UltraShape Refine API")
 
@@ -137,7 +146,7 @@ app.add_middleware(
 
 
 class RefineParameters(BaseModel):
-    precision: Optional[str] = "standard"
+    precision: Optional[str] = DEFAULT_PRECISION
     steps: Optional[int] = None
     octree_res: Optional[int] = None
     num_latents: Optional[int] = None
@@ -175,6 +184,26 @@ class RequestRecord:
     result: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ManagedServiceProcess:
+    name: str
+    process: subprocess.Popen
+
+
+@dataclass
+class BootstrapStatus:
+    state: str = "starting"
+    error: str = ""
+    dependencies_ready: bool = False
+    slots_ready: bool = False
+    workers_ready: bool = False
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+
+
+BOOTSTRAP_STATUS = BootstrapStatus()
+
+
 class NodeBusyError(RuntimeError):
     """Raised when no execution slot is currently available."""
 
@@ -187,19 +216,16 @@ class ConcurrentTaskQueue:
         self._records: dict[str, RequestRecord] = {}
         self._workers: list[threading.Thread] = []
         self._running = False
-        self._idle_callback: Any = None
 
     def start(
         self,
         handler: Any,
         *,
         worker_count: int = 1,
-        idle_callback: Any = None,
     ) -> None:
         with self._cond:
             if any(worker.is_alive() for worker in self._workers):
                 return
-            self._idle_callback = idle_callback
             self._running = True
             self._workers = []
             total = max(1, int(worker_count or 1))
@@ -312,15 +338,8 @@ class ConcurrentTaskQueue:
                     record.error = str(exc)
                     record.finished_at = time.time()
             finally:
-                should_trigger_idle = False
                 with self._cond:
                     self._active_request_ids.discard(request_id)
-                    should_trigger_idle = not self._pending and not self._active_request_ids
-                if should_trigger_idle and self._idle_callback:
-                    try:
-                        self._idle_callback()
-                    except Exception as exc:
-                        print(f"[queue] idle callback failed: {exc}")
 
     def _position_for_request_unlocked(self, request_id: str) -> int:
         if not request_id:
@@ -349,8 +368,129 @@ def _build_refine_options(params: Optional[RefineParameters] = None) -> Dict[str
 
 
 RUN_QUEUE = ConcurrentTaskQueue()
-QUEUE_ACTIVITY_LOCK = threading.Lock()
-QUEUE_ACTIVITY_SEQ = 0
+
+
+def _reset_bootstrap_status() -> None:
+    global BOOTSTRAP_STATUS
+    with BOOTSTRAP_LOCK:
+        BOOTSTRAP_STATUS = BootstrapStatus()
+
+
+def _log_runtime_diagnostics(stage: str, **extra: object) -> None:
+    print(
+        format_runtime_diagnostics(
+            f"refine-api:{stage}",
+            extra={key: value for key, value in extra.items() if value is not None},
+        ),
+        flush=True,
+    )
+
+
+def _log_line(message: str) -> None:
+    print(message, flush=True)
+
+
+def _log_stage(message: str) -> None:
+    _log_line(f"[stage] {message}")
+
+
+def _log_managed_service_exit(
+    proc_info: ManagedServiceProcess,
+    *,
+    prefix: str,
+    returncode: int | None = None,
+) -> None:
+    code = proc_info.process.poll() if returncode is None else returncode
+    _log_line(
+        f"[stack] {prefix} {proc_info.name} pid={proc_info.process.pid} "
+        f"{format_process_exit_status(code)}"
+    )
+
+
+def _update_bootstrap_status(**changes: Any) -> None:
+    with BOOTSTRAP_LOCK:
+        for key, value in changes.items():
+            setattr(BOOTSTRAP_STATUS, key, value)
+
+
+def _bootstrap_snapshot() -> dict[str, Any]:
+    with BOOTSTRAP_LOCK:
+        payload = {
+            "state": BOOTSTRAP_STATUS.state,
+            "error": BOOTSTRAP_STATUS.error,
+            "dependencies_ready": BOOTSTRAP_STATUS.dependencies_ready,
+            "slots_ready": BOOTSTRAP_STATUS.slots_ready,
+            "workers_ready": BOOTSTRAP_STATUS.workers_ready,
+            "started_at": BOOTSTRAP_STATUS.started_at,
+            "finished_at": BOOTSTRAP_STATUS.finished_at,
+        }
+    payload["managed_service_failures"] = _managed_service_failures()
+    return payload
+
+
+def _managed_service_failures() -> List[dict[str, Any]]:
+    failures: List[dict[str, Any]] = []
+    with MANAGED_SERVICE_LOCK:
+        for proc_info in MANAGED_SERVICE_PROCS:
+            exit_code = proc_info.process.poll()
+            if exit_code is None:
+                continue
+            failures.append(
+                {
+                    "name": proc_info.name,
+                    "exit_code": exit_code,
+                    "exit_status": format_process_exit_status(exit_code),
+                }
+            )
+    return failures
+
+
+def _runtime_is_ready() -> bool:
+    snapshot = _bootstrap_snapshot()
+    return (
+        snapshot["state"] == "ready"
+        and snapshot["dependencies_ready"]
+        and snapshot["slots_ready"]
+        and snapshot["workers_ready"]
+        and not snapshot["managed_service_failures"]
+    )
+
+
+def _runtime_live_error() -> str:
+    snapshot = _bootstrap_snapshot()
+    if snapshot["state"] == "failed":
+        return str(snapshot["error"] or "runtime bootstrap failed")
+    failures = snapshot.get("managed_service_failures") or []
+    if failures:
+        first = failures[0]
+        return (
+            "managed service exited: "
+            f"{first['name']} "
+            f"({first.get('exit_status') or format_process_exit_status(first['exit_code'])})"
+        )
+    return ""
+
+
+def _probe_payload(probe: str) -> dict[str, Any]:
+    snapshot = _bootstrap_snapshot()
+    return {
+        "status": "ok",
+        "service": "ultrashape-refine-api",
+        "probe": probe,
+        "bootstrap_state": snapshot["state"],
+        "dependencies_ready": snapshot["dependencies_ready"],
+        "slots_ready": snapshot["slots_ready"],
+        "workers_ready": snapshot["workers_ready"],
+        "error": snapshot["error"],
+        "managed_service_failures": snapshot["managed_service_failures"],
+    }
+
+
+def _require_runtime_ready() -> None:
+    if _runtime_is_ready():
+        return
+    payload = _probe_payload("ready")
+    raise HTTPException(status_code=503, detail=payload)
 
 
 def _build_cache_env(cache_root: str) -> Dict[str, str]:
@@ -380,6 +520,33 @@ def _split_slots(value: str) -> List[str]:
     return [item.strip() for item in value.split(";") if item.strip()]
 
 
+def _primary_visible_device(value: str, *, fallback: str = "") -> str:
+    slots = _split_slots(value) if value else []
+    if len(slots) == 1 and "," in slots[0]:
+        slots = [item.strip() for item in slots[0].split(",") if item.strip()]
+    if slots:
+        return slots[0]
+    return str(fallback or "").strip()
+
+
+def _build_managed_service_env(
+    base_env: Dict[str, str],
+    *,
+    service: str,
+    visible_device: str,
+) -> Dict[str, str]:
+    env = dict(base_env)
+    device = str(visible_device).strip()
+    env["CUDA_VISIBLE_DEVICES"] = device
+    if service == "hunyuan":
+        env["HUNYUAN_CUDA_VISIBLE_DEVICES"] = device
+    elif service == "ultrashape":
+        env["ULTRASHAPE_CUDA_VISIBLE_DEVICES"] = device
+    else:
+        raise ValueError(f"Unsupported managed service: {service}")
+    return env
+
+
 def _parse_service_endpoint(base_url: str) -> Dict[str, object]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"}:
@@ -397,14 +564,19 @@ def _parse_service_endpoint(base_url: str) -> Dict[str, object]:
     }
 
 
-def _wait_for_health(base_url: str, timeout: float, service_name: str) -> None:
+def _normalize_probe_path(path: str) -> str:
+    probe_path = str(path or "").strip() or "/health"
+    return probe_path if probe_path.startswith("/") else f"/{probe_path}"
+
+
+def _wait_for_probe(base_url: str, timeout: float, service_name: str, *, probe_path: str) -> None:
     deadline = time.time() + timeout
-    health_url = f"{base_url.rstrip('/')}/health"
+    probe_url = f"{base_url.rstrip('/')}{_normalize_probe_path(probe_path)}"
     last_error = ""
 
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(health_url, timeout=5) as response:
+            with urllib.request.urlopen(probe_url, timeout=5) as response:
                 if response.status < 400:
                     return
                 last_error = f"HTTP {response.status}"
@@ -413,7 +585,7 @@ def _wait_for_health(base_url: str, timeout: float, service_name: str) -> None:
         time.sleep(1)
 
     raise RuntimeError(
-        f"{service_name} did not become healthy within {timeout:.0f}s: {last_error}"
+        f"{service_name} did not pass {_normalize_probe_path(probe_path)} within {timeout:.0f}s: {last_error}"
     )
 
 
@@ -424,7 +596,17 @@ def _spawn_service_process(
     cwd: str,
     env: Dict[str, str],
 ) -> subprocess.Popen:
-    print(f"[stack] starting {service_name}: {python_bin} {script_path}")
+    device_hint = (
+        env.get("HUNYUAN_CUDA_VISIBLE_DEVICES")
+        or env.get("ULTRASHAPE_CUDA_VISIBLE_DEVICES")
+        or env.get("CUDA_VISIBLE_DEVICES")
+        or "<inherit>"
+    )
+    print(
+        f"[stack] starting {service_name}: {python_bin} {script_path} "
+        f"(cuda_visible_devices={device_hint})",
+        flush=True,
+    )
     return subprocess.Popen(
         [python_bin, script_path],
         cwd=cwd,
@@ -432,137 +614,227 @@ def _spawn_service_process(
     )
 
 
-def _stop_managed_services() -> None:
-    global MANAGED_SERVICES_STARTED
+def _managed_service_name(service_kind: str, slot_id: str | int) -> str:
+    return f"{service_kind}-{slot_id}"
+
+
+def _managed_service_matches(
+    proc_info: ManagedServiceProcess,
+    *,
+    service_kind: str | None = None,
+    slot_id: str | None = None,
+) -> bool:
+    if service_kind is not None and not proc_info.name.startswith(f"{service_kind}-"):
+        return False
+    if slot_id is not None and proc_info.name != _managed_service_name(service_kind or "", slot_id):
+        return False
+    return True
+
+
+def _find_managed_service_locked(service_name: str) -> ManagedServiceProcess | None:
+    for proc_info in MANAGED_SERVICE_PROCS:
+        if proc_info.name == service_name:
+            return proc_info
+    return None
+
+
+def _managed_service_enabled(service_kind: str) -> bool:
+    if service_kind == "hunyuan":
+        return AUTO_START_HUNYUAN
+    if service_kind == "ultrashape":
+        return AUTO_START_ULTRASHAPE
+    raise ValueError(f"Unsupported service kind: {service_kind}")
+
+
+def _managed_service_specs(service_kind: str) -> List[Dict[str, str]]:
+    if service_kind == "hunyuan":
+        urls = _split_slots(HUNYUAN_SERVICE_URLS)
+        devices = _split_slots(HUNYUAN_CUDA_VISIBLE_DEVICES_LIST)
+        if len(urls) != len(devices):
+            raise RuntimeError(
+                "HUNYUAN_SERVICE_URLS and HUNYUAN_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+            )
+        specs: List[Dict[str, str]] = []
+        for idx, (base_url, device) in enumerate(zip(urls, devices)):
+            endpoint = _parse_service_endpoint(base_url)
+            specs.append(
+                {
+                    "service_name": _managed_service_name("hunyuan", idx),
+                    "base_url": str(base_url),
+                    "visible_device": str(device),
+                    "python_bin": HUNYUAN_SERVICE_PYTHON,
+                    "script_path": os.path.join(HUNYUAN_ROOT, "api", "hunyuan_server.py"),
+                    "cwd": HUNYUAN_ROOT,
+                    "cache_dir": HUNYUAN_CACHE_DIR,
+                    "host": str(endpoint["bind_host"]),
+                    "port": str(endpoint["port"]),
+                    "slot_id": str(idx),
+                }
+            )
+        return specs
+    if service_kind == "ultrashape":
+        urls = _split_slots(ULTRASHAPE_SERVICE_URLS)
+        devices = _split_slots(ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST)
+        if len(urls) != len(devices):
+            raise RuntimeError(
+                "ULTRASHAPE_SERVICE_URLS and ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+            )
+        specs = []
+        for idx, (base_url, device) in enumerate(zip(urls, devices)):
+            endpoint = _parse_service_endpoint(base_url)
+            specs.append(
+                {
+                    "service_name": _managed_service_name("ultrashape", idx),
+                    "base_url": str(base_url),
+                    "visible_device": str(device),
+                    "python_bin": ULTRASHAPE_SERVICE_PYTHON,
+                    "script_path": os.path.join(ULTRASHAPE_ROOT, "api", "ultrashape_server.py"),
+                    "cwd": ULTRASHAPE_ROOT,
+                    "cache_dir": ULTRASHAPE_CACHE_DIR,
+                    "host": str(endpoint["bind_host"]),
+                    "port": str(endpoint["port"]),
+                    "slot_id": str(idx),
+                }
+            )
+        return specs
+    raise ValueError(f"Unsupported service kind: {service_kind}")
+
+
+def _build_managed_service_process_env(service_kind: str, spec: Dict[str, str]) -> Dict[str, str]:
+    env = os.environ.copy()
+    env.update(_build_cache_env(spec["cache_dir"]))
+    env = _build_managed_service_env(
+        env,
+        service=service_kind,
+        visible_device=spec["visible_device"],
+    )
+    if service_kind == "hunyuan":
+        env.update(
+            {
+                "HUNYUAN_ROOT": HUNYUAN_ROOT,
+                "HUNYUAN_CACHE_DIR": HUNYUAN_CACHE_DIR,
+                "HUNYUAN_SERVICE_HOST": spec["host"],
+                "HUNYUAN_SERVICE_PORT": spec["port"],
+            }
+        )
+    elif service_kind == "ultrashape":
+        env.update(
+            {
+                "ULTRASHAPE_CACHE_DIR": ULTRASHAPE_CACHE_DIR,
+                "ULTRASHAPE_SERVICE_HOST": spec["host"],
+                "ULTRASHAPE_SERVICE_PORT": spec["port"],
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported service kind: {service_kind}")
+    return env
+
+
+def _stop_managed_services(
+    service_kind: str | None = None,
+    *,
+    slot_id: str | None = None,
+) -> None:
     with MANAGED_SERVICE_LOCK:
-        procs = list(MANAGED_SERVICE_PROCS)
-        MANAGED_SERVICE_PROCS.clear()
-        MANAGED_SERVICES_STARTED = False
+        if service_kind is None and slot_id is None:
+            procs = list(MANAGED_SERVICE_PROCS)
+            MANAGED_SERVICE_PROCS.clear()
+        else:
+            procs = []
+            remaining = []
+            for proc_info in MANAGED_SERVICE_PROCS:
+                if _managed_service_matches(
+                    proc_info,
+                    service_kind=service_kind,
+                    slot_id=slot_id,
+                ):
+                    procs.append(proc_info)
+                else:
+                    remaining.append(proc_info)
+            MANAGED_SERVICE_PROCS[:] = remaining
 
     if not procs:
         return
 
-    for proc in procs:
-        if proc.poll() is None:
-            proc.terminate()
+    for proc_info in procs:
+        if proc_info.process.poll() is not None:
+            _log_managed_service_exit(proc_info, prefix="service already stopped")
+            continue
+        _log_line(f"[stack] stopping {proc_info.name} pid={proc_info.process.pid} via terminate")
+        proc_info.process.terminate()
 
     deadline = time.time() + 10
-    for proc in procs:
-        if proc.poll() is not None:
+    for proc_info in procs:
+        proc = proc_info.process
+        exit_code = proc.poll()
+        if exit_code is not None:
+            _log_managed_service_exit(proc_info, prefix="service stopped", returncode=exit_code)
             continue
         remaining = max(0, deadline - time.time())
         try:
             proc.wait(timeout=remaining)
+            _log_managed_service_exit(proc_info, prefix="service stopped")
         except subprocess.TimeoutExpired:
+            _log_line(f"[stack] killing {proc_info.name} pid={proc.pid} after terminate timeout")
             proc.kill()
+            proc.wait(timeout=5)
+            _log_managed_service_exit(proc_info, prefix="service killed")
 
 
-def _start_managed_services() -> None:
-    global MANAGED_SERVICES_STARTED
+def _start_managed_services(
+    service_kind: str,
+    *,
+    slot_id: str | None = None,
+) -> None:
     if not USE_REMOTE_SERVICES or not AUTO_START_LOCAL_SERVICES:
+        return
+    if not _managed_service_enabled(service_kind):
         return
 
     with MANAGED_SERVICE_LOCK:
-        if MANAGED_SERVICES_STARTED:
-            return
-
-        started: List[subprocess.Popen] = []
+        started: List[ManagedServiceProcess] = []
         try:
-            if AUTO_START_HUNYUAN:
-                hunyuan_urls = _split_slots(HUNYUAN_SERVICE_URLS)
-                hunyuan_devices = _split_slots(HUNYUAN_CUDA_VISIBLE_DEVICES_LIST)
-                if len(hunyuan_urls) != len(hunyuan_devices):
-                    raise RuntimeError(
-                        "HUNYUAN_SERVICE_URLS and HUNYUAN_CUDA_VISIBLE_DEVICES_LIST length mismatch"
+            for spec in _managed_service_specs(service_kind):
+                if slot_id is not None and spec["slot_id"] != str(slot_id):
+                    continue
+                existing = _find_managed_service_locked(spec["service_name"])
+                if existing is not None:
+                    if existing.process.poll() is None:
+                        continue
+                    _log_managed_service_exit(
+                        existing,
+                        prefix="removing exited service before restart",
                     )
-
-                for idx, (base_url, device) in enumerate(
-                    zip(hunyuan_urls, hunyuan_devices)
-                ):
-                    endpoint = _parse_service_endpoint(base_url)
-                    env = os.environ.copy()
-                    env.update(_build_cache_env(HUNYUAN_CACHE_DIR))
-                    env.update(
-                        {
-                            "HUNYUAN_ROOT": HUNYUAN_ROOT,
-                            "HUNYUAN_CACHE_DIR": HUNYUAN_CACHE_DIR,
-                            "HUNYUAN_CUDA_VISIBLE_DEVICES": device,
-                            "HUNYUAN_SERVICE_HOST": str(endpoint["bind_host"]),
-                            "HUNYUAN_SERVICE_PORT": str(endpoint["port"]),
-                        }
-                    )
-                    started.append(
-                        _spawn_service_process(
-                            f"hunyuan-{idx}",
-                            HUNYUAN_SERVICE_PYTHON,
-                            os.path.join(HUNYUAN_ROOT, "api", "hunyuan_server.py"),
-                            HUNYUAN_ROOT,
+                    MANAGED_SERVICE_PROCS.remove(existing)
+                env = _build_managed_service_process_env(service_kind, spec)
+                started.append(
+                    ManagedServiceProcess(
+                        name=spec["service_name"],
+                        process=_spawn_service_process(
+                            spec["service_name"],
+                            spec["python_bin"],
+                            spec["script_path"],
+                            spec["cwd"],
                             env,
-                        )
+                        ),
                     )
-
-            if AUTO_START_ULTRASHAPE:
-                ultrashape_urls = _split_slots(ULTRASHAPE_SERVICE_URLS)
-                ultrashape_devices = _split_slots(ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST)
-                if len(ultrashape_urls) != len(ultrashape_devices):
-                    raise RuntimeError(
-                        "ULTRASHAPE_SERVICE_URLS and ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST length mismatch"
-                    )
-
-                for idx, (base_url, device) in enumerate(
-                    zip(ultrashape_urls, ultrashape_devices)
-                ):
-                    endpoint = _parse_service_endpoint(base_url)
-                    env = os.environ.copy()
-                    env.update(_build_cache_env(ULTRASHAPE_CACHE_DIR))
-                    env.update(
-                        {
-                            "ULTRASHAPE_CACHE_DIR": ULTRASHAPE_CACHE_DIR,
-                            "ULTRASHAPE_CUDA_VISIBLE_DEVICES": device,
-                            "ULTRASHAPE_SERVICE_HOST": str(endpoint["bind_host"]),
-                            "ULTRASHAPE_SERVICE_PORT": str(endpoint["port"]),
-                        }
-                    )
-                    started.append(
-                        _spawn_service_process(
-                            f"ultrashape-{idx}",
-                            ULTRASHAPE_SERVICE_PYTHON,
-                            os.path.join(ULTRASHAPE_ROOT, "api", "ultrashape_server.py"),
-                            ULTRASHAPE_ROOT,
-                            env,
-                        )
-                    )
+                )
 
             MANAGED_SERVICE_PROCS.extend(started)
-
-            if AUTO_START_HUNYUAN:
-                for idx, base_url in enumerate(_split_slots(HUNYUAN_SERVICE_URLS)):
-                    _wait_for_health(
-                        base_url,
-                        LOCAL_SERVICE_START_TIMEOUT,
-                        f"hunyuan-{idx}",
-                    )
-            if AUTO_START_ULTRASHAPE:
-                for idx, base_url in enumerate(_split_slots(ULTRASHAPE_SERVICE_URLS)):
-                    _wait_for_health(
-                        base_url,
-                        LOCAL_SERVICE_START_TIMEOUT,
-                        f"ultrashape-{idx}",
-                    )
-
-            MANAGED_SERVICES_STARTED = True
-            print("[stack] managed localhost services are healthy")
         except Exception:
-            for proc in started:
+            for proc_info in started:
+                proc = proc_info.process
                 if proc.poll() is None:
                     proc.terminate()
-            for proc in started:
+            for proc_info in started:
+                proc = proc_info.process
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-            MANAGED_SERVICE_PROCS.clear()
-            MANAGED_SERVICES_STARTED = False
+            for proc_info in started:
+                with contextlib.suppress(ValueError):
+                    MANAGED_SERVICE_PROCS.remove(proc_info)
             raise
 
 
@@ -619,7 +891,7 @@ def _init_slots() -> None:
         for slot in SLOTS:
             SLOT_QUEUE.put(slot)
         slot_ids = ",".join(slot["slot_id"] for slot in SLOTS)
-        print(f"[scheduler] slots ready: {slot_ids}")
+        _log_line(f"[scheduler] slots ready: {slot_ids}")
 
 
 def _acquire_slot(*, block: bool = True, timeout: float | None = None) -> Dict[str, str]:
@@ -633,13 +905,67 @@ def _acquire_slot(*, block: bool = True, timeout: float | None = None) -> Dict[s
             slot = SLOT_QUEUE.get_nowait()
     except queue.Empty as exc:
         raise NodeBusyError("node busy") from exc
-    print(f"[scheduler] acquired slot {slot['slot_id']}")
+    _log_line(f"[scheduler] acquired slot {slot['slot_id']}")
     return slot
 
 
 def _release_slot(slot: Dict[str, str]) -> None:
     SLOT_QUEUE.put(slot)
-    print(f"[scheduler] released slot {slot['slot_id']}")
+    _log_line(f"[scheduler] released slot {slot['slot_id']}")
+
+
+def _wait_for_slot_services_ready() -> None:
+    if not USE_REMOTE_SERVICES:
+        return
+
+    seen: set[tuple[str, str]] = set()
+    with SLOTS_LOCK:
+        slots = list(SLOTS)
+
+    for slot in slots:
+        for service_name, url_key in (("hunyuan", "hunyuan_url"), ("ultrashape", "ultrashape_url")):
+            base_url = str(slot.get(url_key) or "").strip()
+            if not base_url:
+                continue
+            identity = (service_name, base_url)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            _wait_for_probe(
+                base_url,
+                LOCAL_SERVICE_START_TIMEOUT,
+                f"{service_name}:{base_url}",
+                probe_path="/ready",
+            )
+
+
+def _ensure_slot_service_ready(service_kind: str, slot: Mapping[str, str]) -> None:
+    if not USE_REMOTE_SERVICES:
+        return
+
+    slot_id = str(slot.get("slot_id") or "").strip()
+    base_url = str(slot.get(f"{service_kind}_url") or "").strip()
+    if not base_url:
+        return
+
+    if AUTO_START_LOCAL_SERVICES and _managed_service_enabled(service_kind):
+        _start_managed_services(service_kind, slot_id=slot_id or None)
+
+    _wait_for_probe(
+        base_url,
+        LOCAL_SERVICE_START_TIMEOUT,
+        f"{service_kind}:{slot_id or base_url}",
+        probe_path="/ready",
+    )
+
+
+def _stop_slot_service(service_kind: str, slot: Mapping[str, str]) -> None:
+    if not USE_REMOTE_SERVICES or not AUTO_START_LOCAL_SERVICES:
+        return
+    if not _managed_service_enabled(service_kind):
+        return
+    slot_id = str(slot.get("slot_id") or "").strip()
+    _stop_managed_services(service_kind, slot_id=slot_id or None)
 
 
 def _post_json(
@@ -794,52 +1120,6 @@ def _upload_artifact(local_path: str, oss_key: str) -> dict[str, str]:
     }
 
 
-def _call_task_manager_pause() -> None:
-    if not TASK_MANAGER_BASE:
-        print("[task-manager] TASK_MANAGER_BASE empty, skip pause")
-        return
-    payload = {"project": TASK_MANAGER_PROJECT}
-    headers: Dict[str, str] = {}
-    if TASK_MANAGER_API_KEY:
-        headers["Authorization"] = f"Bearer {TASK_MANAGER_API_KEY}"
-    try:
-        _post_json(
-            f"{TASK_MANAGER_BASE}/api/task/pause",
-            payload,
-            timeout=30,
-            headers=headers,
-        )
-        print(f"[task-manager] paused project={TASK_MANAGER_PROJECT}")
-    except Exception as exc:
-        print(f"[task-manager] pause failed: {exc}")
-
-
-def _bump_queue_activity() -> int:
-    global QUEUE_ACTIVITY_SEQ
-    with QUEUE_ACTIVITY_LOCK:
-        QUEUE_ACTIVITY_SEQ += 1
-        return QUEUE_ACTIVITY_SEQ
-
-
-def _current_queue_activity() -> int:
-    with QUEUE_ACTIVITY_LOCK:
-        return QUEUE_ACTIVITY_SEQ
-
-
-def _schedule_pause_if_idle() -> None:
-    expected_seq = _current_queue_activity()
-
-    def _runner() -> None:
-        time.sleep(max(0.0, QUEUE_IDLE_PAUSE_DELAY_SEC))
-        if _current_queue_activity() != expected_seq:
-            return
-        if not RUN_QUEUE.is_idle():
-            return
-        _call_task_manager_pause()
-
-    threading.Thread(target=_runner, daemon=True, name=f"ultrashape-idle-pause-{expected_seq}").start()
-
-
 def _legacy_task_status(status: str) -> str:
     return {
         "pending": "PENDING",
@@ -884,6 +1164,26 @@ def _call_ultrashape_service(
     if not mesh_base64:
         raise RuntimeError("UltraShape service returned empty mesh")
     return base64.b64decode(mesh_base64)
+
+
+def _apply_remote_memory_action(base_url: str, action: str, service_name: str) -> None:
+    normalized = normalize_memory_action(action, default="none")
+    if normalized == "none":
+        return
+
+    try:
+        _post_json(
+            f"{base_url.rstrip('/')}/memory/{normalized}",
+            {},
+            timeout=MEMORY_ACTION_TIMEOUT,
+        )
+        print(f"[memory] {service_name} {normalized} completed")
+    except Exception as exc:
+        detail = f"{service_name} {normalized} failed: {exc}"
+        if service_name == "ultrashape":
+            print(f"[memory] {detail}")
+            return
+        raise RuntimeError(detail) from exc
 
 
 def _prefetch_hunyuan_models() -> None:
@@ -1226,16 +1526,22 @@ def _run_refinement_job(
     slot = _acquire_slot(block=wait_for_slot)
 
     _write_binary(input_image_path, image_bytes)
-    print(f"[api] request={request_id} workspace={workspace_dir}")
+    _log_line(f"[api] request={request_id} workspace={workspace_dir}")
 
     try:
         if USE_REMOTE_SERVICES:
-            coarse_mesh_bytes = _call_hunyuan_service(image_bytes, slot["hunyuan_url"])
-            refined_mesh_bytes = _call_ultrashape_service(
-                image_bytes,
-                coarse_mesh_bytes,
-                slot["ultrashape_url"],
-                params,
+            refined_mesh_bytes = run_remote_refinement_pipeline(
+                image_bytes=image_bytes,
+                slot=slot,
+                params=params,
+                call_hunyuan=_call_hunyuan_service,
+                call_ultrashape=_call_ultrashape_service,
+                apply_memory_action=_apply_remote_memory_action,
+                ensure_service_ready=_ensure_slot_service_ready,
+                stop_service=_stop_slot_service,
+                log_stage=_log_stage,
+                hunyuan_post_action=HUNYUAN_POST_ACTION,
+                ultrashape_post_action=ULTRASHAPE_POST_ACTION,
             )
             _write_binary(refined_path, refined_mesh_bytes)
         else:
@@ -1296,17 +1602,87 @@ def _start_worker() -> None:
     RUN_QUEUE.start(
         _execute_run_request,
         worker_count=max(1, worker_count),
-        idle_callback=_schedule_pause_if_idle,
     )
+    _update_bootstrap_status(workers_ready=True)
+
+
+def _start_hot_start_thread() -> None:
+    if not HOT_START_ENABLED:
+        return
+    threading.Thread(target=_hot_start, daemon=True, name="ultrashape-hot-start").start()
+
+
+def _bootstrap_runtime() -> None:
+    try:
+        _log_runtime_diagnostics(
+            "bootstrap_start",
+            use_remote_services=USE_REMOTE_SERVICES,
+            hunyuan_visible_devices=_primary_visible_device(
+                HUNYUAN_CUDA_VISIBLE_DEVICES_LIST,
+                fallback=HUNYUAN_CUDA_VISIBLE_DEVICES,
+            ),
+            ultrashape_visible_devices=_primary_visible_device(
+                ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST,
+                fallback=ULTRASHAPE_CUDA_VISIBLE_DEVICES,
+            ),
+        )
+        _init_slots()
+        with SLOTS_LOCK:
+            slots = list(SLOTS)
+        for slot in slots:
+            _ensure_slot_service_ready("hunyuan", slot)
+        _update_bootstrap_status(slots_ready=True)
+        _update_bootstrap_status(
+            state="ready",
+            dependencies_ready=True,
+            finished_at=time.time(),
+        )
+        _log_runtime_diagnostics("bootstrap_ready", slots=len(SLOTS))
+        _log_line("[bootstrap] runtime is ready to receive requests")
+    except Exception as exc:
+        error = str(exc)
+        _log_runtime_diagnostics("bootstrap_failed", error=error)
+        _log_line(f"[bootstrap] runtime bootstrap failed: {error}")
+        _update_bootstrap_status(
+            state="failed",
+            error=error,
+            finished_at=time.time(),
+        )
+
+
+def _start_bootstrap_thread() -> None:
+    global BOOTSTRAP_THREAD
+    with BOOTSTRAP_LOCK:
+        if BOOTSTRAP_THREAD is not None and BOOTSTRAP_THREAD.is_alive():
+            return
+        BOOTSTRAP_THREAD = threading.Thread(
+            target=_bootstrap_runtime,
+            daemon=True,
+            name="ultrashape-runtime-bootstrap",
+        )
+        BOOTSTRAP_THREAD.start()
 
 
 @app.on_event("startup")
 def _startup() -> None:
+    _reset_bootstrap_status()
     _ensure_dirs()
-    _hot_start()
-    _start_managed_services()
-    _init_slots()
+    _log_runtime_diagnostics(
+        "startup",
+        use_remote_services=USE_REMOTE_SERVICES,
+        hot_start_enabled=HOT_START_ENABLED,
+        hunyuan_visible_devices=_primary_visible_device(
+            HUNYUAN_CUDA_VISIBLE_DEVICES_LIST,
+            fallback=HUNYUAN_CUDA_VISIBLE_DEVICES,
+        ),
+        ultrashape_visible_devices=_primary_visible_device(
+            ULTRASHAPE_CUDA_VISIBLE_DEVICES_LIST,
+            fallback=ULTRASHAPE_CUDA_VISIBLE_DEVICES,
+        ),
+    )
     _start_worker()
+    _start_hot_start_thread()
+    _start_bootstrap_thread()
 
 
 @app.on_event("shutdown")
@@ -1316,11 +1692,31 @@ def _shutdown() -> None:
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return _probe_payload("health")
+
+
+@app.get("/ready")
+def ready_check():
+    payload = _probe_payload("ready")
+    if _runtime_is_ready():
+        return payload
+    payload["status"] = "starting"
+    return JSONResponse(status_code=503, content=payload)
+
+
+@app.get("/live")
+def live_check():
+    payload = _probe_payload("live")
+    error = _runtime_live_error()
+    if not error:
+        return payload
+    payload["status"] = "failed"
+    payload["error"] = error
+    return JSONResponse(status_code=503, content=payload)
 
 
 def _build_params_from_form(
-    precision: str = "standard",
+    precision: str = DEFAULT_PRECISION,
     steps: Optional[int] = None,
     octree_res: Optional[int] = None,
     num_latents: Optional[int] = None,
@@ -1379,7 +1775,6 @@ def _enqueue_request(
         if active_count >= TASK_QUEUE_MAXSIZE:
             raise HTTPException(status_code=429, detail="Queue is full, try again later")
 
-    _bump_queue_activity()
     try:
         return RUN_QUEUE.enqueue(
             _build_queue_payload(image_bytes, upload_name=upload_name, params=params),
@@ -1417,7 +1812,7 @@ async def reconstruct(
     show_mesh: bool = Form(True),  # accepted for compatibility, unused by ultrashape
     filter_sky_bg: bool = Form(False),  # accepted for compatibility, unused by ultrashape
     filter_ambiguous: bool = Form(True),  # accepted for compatibility, unused by ultrashape
-    precision: str = Form("standard"),
+    precision: str = Form(DEFAULT_PRECISION),
     steps: Optional[int] = Form(None),
     octree_res: Optional[int] = Form(None),
     num_latents: Optional[int] = Form(None),
@@ -1427,6 +1822,7 @@ async def reconstruct(
     scale: Optional[float] = Form(0.99),
 ):
     del time_interval, frame_selector, show_camera, show_mesh, filter_sky_bg, filter_ambiguous
+    _require_runtime_ready()
     uploads = [item for item in ([image] if image else []) if item is not None]
     if files:
         uploads.extend(files)
@@ -1460,7 +1856,7 @@ async def run_with_files(
     image: UploadFile | None = File(None),
     files: list[UploadFile] | None = File(None),
     request_id: str = Form(""),
-    precision: str = Form("standard"),
+    precision: str = Form(DEFAULT_PRECISION),
     steps: Optional[int] = Form(None),
     octree_res: Optional[int] = Form(None),
     num_latents: Optional[int] = Form(None),
@@ -1469,6 +1865,7 @@ async def run_with_files(
     remove_bg: Optional[bool] = Form(False),
     scale: Optional[float] = Form(0.99),
 ):
+    _require_runtime_ready()
     uploads = [item for item in ([image] if image else []) if item is not None]
     if files:
         uploads.extend(files)
@@ -1500,7 +1897,7 @@ async def run_with_files(
 @app.post("/generate")
 async def generate(
     image: UploadFile = File(...),
-    precision: str = Form("standard"),
+    precision: str = Form(DEFAULT_PRECISION),
     steps: Optional[int] = Form(None),
     octree_res: Optional[int] = Form(None),
     num_latents: Optional[int] = Form(None),
@@ -1509,6 +1906,7 @@ async def generate(
     remove_bg: Optional[bool] = Form(False),
     scale: Optional[float] = Form(0.99),
 ):
+    _require_runtime_ready()
     upload = _ensure_image_upload([image])
     image_bytes = await _read_upload_bytes(upload)
     params = _build_params_from_form(
@@ -1528,6 +1926,7 @@ async def generate(
 
 @app.post("/generate_3d")
 async def generate_3d(req: GenerateRequest):
+    _require_runtime_ready()
     image_bytes = _load_image_from_base64(req.image_base64)
     params = RefineParameters(**_model_dump(req, exclude={"image_base64"}))
     result = _run_refinement_job(uuid.uuid4().hex, image_bytes, "input-image.png", params)
@@ -1542,6 +1941,7 @@ async def generate_3d(req: GenerateRequest):
 
 @app.post("/api/v1/services/aigc/3d-refine/generation")
 async def generate_async(req: AsyncGenerateRequest):
+    _require_runtime_ready()
     image_bytes = _load_image_from_base64(req.input.image_base64)
     params = req.parameters or AsyncParameters()
     task_id, _position = _enqueue_request(
