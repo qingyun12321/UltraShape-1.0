@@ -62,11 +62,11 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
     "request_id": "optional-client-id"
   },
   "parameters": {
-    "precision": "standard",
-    "steps": 50,
-    "octree_res": 512,
-    "num_latents": 4096,
-    "chunk_size": 20000,
+    "precision": "balanced",
+    "steps": 24,
+    "octree_res": 768,
+    "num_latents": 16384,
+    "chunk_size": 2048,
     "seed": 42,
     "remove_bg": false,
     "scale": 0.99
@@ -92,7 +92,7 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `precision` | string | 否 | `standard` | 推理预设 |
+| `precision` | string | 否 | `balanced` | 推理预设，支持 `fast`、`balanced`、`quality` |
 | `steps` | integer | 否 | 预设值 | 采样步数 |
 | `octree_res` | integer | 否 | 预设值 | 八叉树分辨率 |
 | `num_latents` | integer | 否 | 预设值 | latent 数量 |
@@ -106,6 +106,22 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 - 当前仅支持 `1` 张图片
 - 支持格式：`PNG`、`JPG`、`JPEG`、`WEBP`、`BMP`
 
+#### 预设说明
+
+`precision` 支持以下 3 个档位：
+
+| 档位 | 默认参数 |
+|---|---|
+| `fast` | `steps=12`、`octree_res=512`、`num_latents=8192`、`chunk_size=2048` |
+| `balanced` | `steps=24`、`octree_res=768`、`num_latents=16384`、`chunk_size=2048` |
+| `quality` | `steps=50`、`octree_res=1024`、`num_latents=32768`、`chunk_size=8000` |
+
+说明：
+
+- 当不传 `precision` 时，默认使用 `balanced`
+- 如果同时传了 `precision` 和具体数值参数，则具体数值参数会覆盖预设值
+- 推荐调用方仅传 `precision`，在确有需要时再覆盖细分参数
+
 ### 5.5 请求示例
 
 ```bash
@@ -117,7 +133,7 @@ curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/r
       "request_id":"req-001"
     },
     "parameters":{
-      "precision":"standard",
+      "precision":"balanced",
       "seed":42,
       "remove_bg":false,
       "scale":0.99
@@ -264,17 +280,9 @@ curl --location 'http://36.133.236.108:8091/api/v1/tasks/44c6f1f6f2ff42889d29aaf
 | 任务返回 `FAILED` | 展示 `message`，并根据业务决定是否重新提交 |
 | 查询接口返回 `404` | 检查 `task_id` 是否正确 |
 
-## 9. Runtime 兼容接口
+## 9. 接入建议
 
-以下接口主要用于内部调试、旧版接入或 runtime 直连，不建议作为新的公共接入方式：
+对外接入时，仅建议使用本文档中的公共 API：
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/health` | 运行时健康检查 |
-| `POST` | `/reconstruct` | task-manager 转发到 runtime 的内部兼容入口 |
-| `POST` | `/run_with_files` | 旧版排队接口 |
-| `GET` | `/queue_status` | 旧版排队状态接口 |
-| `GET` | `/request_status` | 旧版请求状态接口 |
-| `POST` | `/generate` | 直出 GLB 下载跳转 |
-| `POST` | `/generate_3d` | base64 入参的同步接口 |
-| `POST` | `/api/v1/services/aigc/3d-refine/generation` | runtime 自身的异步接口 |
+- `POST /api/v1/services/aigc/3d-generation/reconstruction`
+- `GET /api/v1/tasks/{task_id}`
