@@ -113,7 +113,7 @@ ULTRASHAPE_SERVICE_PYTHON = os.environ.get(
     "ULTRASHAPE_SERVICE_PYTHON", os.environ.get("PYTHON_BIN", sys.executable)
 )
 OSS_BUCKET = os.environ.get("ULTRASHAPE_OSS_BUCKET", "kokokoni")
-OSS_PREFIX = os.environ.get("ULTRASHAPE_OSS_PREFIX", "docker-input&output/ultrashape").strip("/")
+OSS_PREFIX = os.environ.get("ULTRASHAPE_OSS_PREFIX", "docker-input&output/kokoni-shape").strip("/")
 OSS_SIGN_EXPIRES = os.environ.get("ULTRASHAPE_OSS_SIGN_EXPIRES", "24h")
 TMP_ROOT = os.environ.get("ULTRASHAPE_TMP_ROOT", "/tmp/ultrashape-oss-workspace")
 ULTRASHAPE_QUEUE_WORKERS = int(os.environ.get("ULTRASHAPE_QUEUE_WORKERS", "0"))
@@ -134,7 +134,7 @@ MANAGED_SERVICE_PROCS: List["ManagedServiceProcess"] = []
 BOOTSTRAP_LOCK = threading.Lock()
 BOOTSTRAP_THREAD: Optional[threading.Thread] = None
 
-app = FastAPI(title="UltraShape Refine API")
+app = FastAPI(title="kokoni-shape API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,7 +169,7 @@ class AsyncParameters(RefineParameters):
 
 
 class AsyncGenerateRequest(BaseModel):
-    model: Optional[str] = "ultrashape-refine"
+    model: Optional[str] = "kokoni-shape"
     input: AsyncInput
     parameters: Optional[AsyncParameters] = None
 
@@ -475,7 +475,7 @@ def _probe_payload(probe: str) -> dict[str, Any]:
     snapshot = _bootstrap_snapshot()
     return {
         "status": "ok",
-        "service": "ultrashape-refine-api",
+        "service": "kokoni-shape-api",
         "probe": probe,
         "bootstrap_state": snapshot["state"],
         "dependencies_ready": snapshot["dependencies_ready"],
@@ -1162,7 +1162,7 @@ def _call_ultrashape_service(
     )
     mesh_base64 = response.get("mesh_base64")
     if not mesh_base64:
-        raise RuntimeError("UltraShape service returned empty mesh")
+        raise RuntimeError("kokoni-shape service returned empty mesh")
     return base64.b64decode(mesh_base64)
 
 
@@ -1234,7 +1234,7 @@ def _prefetch_hunyuan_models() -> None:
 
 def _prefetch_ultrashape_models() -> None:
     if not os.path.isdir(ULTRASHAPE_ROOT):
-        print(f"[hot-start] UltraShape root not found: {ULTRASHAPE_ROOT}")
+        print(f"[hot-start] kokoni-shape root not found: {ULTRASHAPE_ROOT}")
         return
 
     script = textwrap.dedent(
@@ -1407,7 +1407,7 @@ def _run_ultrashape(
     params: Optional[RefineParameters] = None,
 ) -> str:
     if not os.path.isdir(ULTRASHAPE_ROOT):
-        raise RuntimeError(f"UltraShape root not found: {ULTRASHAPE_ROOT}")
+        raise RuntimeError(f"kokoni-shape root not found: {ULTRASHAPE_ROOT}")
 
     refine_options = _build_refine_options(params)
     env = os.environ.copy()
@@ -1464,7 +1464,7 @@ def _run_ultrashape(
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
-        details = stderr or stdout or "UltraShape refine failed"
+        details = stderr or stdout or "kokoni-shape refinement failed"
         if ULTRASHAPE_OOM_RETRY and "out of memory" in details.lower():
             retry_env = env.copy()
             retry_env["ULTRASHAPE_OCTREE_RES"] = str(ULTRASHAPE_OOM_OCTREE_RES)
@@ -1476,7 +1476,7 @@ def _run_ultrashape(
             if result.returncode != 0:
                 stderr = result.stderr.strip()
                 stdout = result.stdout.strip()
-                details = stderr or stdout or "UltraShape refine failed"
+                details = stderr or stdout or "kokoni-shape refinement failed"
                 raise RuntimeError(details)
         else:
             raise RuntimeError(details)
@@ -1484,7 +1484,7 @@ def _run_ultrashape(
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     refined_path = os.path.join(output_dir, f"{base_name}_refined.glb")
     if not os.path.exists(refined_path):
-        raise RuntimeError("UltraShape output missing")
+        raise RuntimeError("kokoni-shape output missing")
 
     return refined_path
 
